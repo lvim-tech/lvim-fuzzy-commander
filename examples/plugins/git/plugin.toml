@@ -1,0 +1,27 @@
+# An example lvc plugin: git in the panel's directory. Copy the folder to
+# ~/.config/lvim-commander/plugins/git/ (scripts next to plugin.toml are reached through $LVC_PLUGIN_DIR).
+name = "git"
+description = "git status / log / diff, and a jump to the repository root"
+
+[actions.status]
+title   = "git status"
+key     = "ctrl-c G"
+command = "git status"
+mode    = "wait"
+
+[actions.log]
+title   = "git log of the file"
+command = "git log --oneline --graph --color=always -- {} | less -R"
+mode    = "tty"
+
+[actions.root]
+title   = "go to the repository root"
+key     = "ctrl-c R"
+command = "sh \"$LVC_PLUGIN_DIR/root.sh\""
+mode    = "control"
+
+[previewers.diff]
+# a file that git says is changed: its diff; everything else falls through to the normal preview only
+# when this previewer does not apply — so it is limited to the extensions that matter here
+command    = "git diff --color=always -- {} | head -n 300; git log -1 --format='%C(yellow)%h %Creset%s' -- {}"
+extensions = ["patch", "diff"]

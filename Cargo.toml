@@ -1,0 +1,33 @@
+[package]
+name = "lvim-fuzzy-commander"
+version = "0.1.0"
+edition = "2024"
+license = "BSD-3-Clause"
+description = "A two-panel file manager for the terminal (Midnight Commander style), with the lvim look and the lvim-fuzzy search"
+repository = "https://github.com/lvim-tech/lvim-fuzzy-commander"
+rust-version = "1.85"
+
+[[bin]]
+name = "lvim-fuzzy-commander"
+path = "src/main.rs"
+
+[dependencies]
+# the search engine (fuzzy filtering of a panel)
+lvim-fuzzy-core = { path = "../lvim-fuzzy-core" }
+# the lvim look: themes, canvas, icons, file and Neovim previews, the warm Neovim pool
+lvim-fuzzy-ui = { path = "../lvim-fuzzy-ui" }
+crossterm = { version = "0.29", features = ["use-dev-tty"] }
+toml = "0.9"
+serde_json = "1"
+# the plugin host (process, native, WebAssembly and Lua runtimes), shared with lvim-fuzzy-cli and lvim-picker
+lvim-fuzzy-plugin = { path = "../lvim-fuzzy-plugin" }
+# the preview plugin ships inside this program (`lvim-fuzzy-commander --lvim-plugin preview`) and installs itself
+lvim-fuzzy-plugin-preview = { path = "../lvim-fuzzy-plugin-preview" }
+# ... and the open plugin (`lvim-fuzzy-commander --lvim-plugin open`)
+lvim-fuzzy-plugin-open = { path = "../lvim-fuzzy-plugin-open" }
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
