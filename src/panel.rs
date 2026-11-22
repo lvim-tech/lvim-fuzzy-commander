@@ -83,6 +83,22 @@ pub struct Panel {
     pub error: Option<String>,
     /// Something the panel refused to do and the app should say (a remote does not let go of the panel but by disconnecting).
     pub notice: Option<String>,
+    /// The state of the git work tree the directory is in (read by the app in the background; `None`: not in one).
+    pub git: Option<std::sync::Arc<lvim_fuzzy_plugin_git::status::Status>>,
+    /// Where the directory is in that work tree (`""` = its top).
+    pub git_base: String,
+    /// The directory `git` was read for (on the remote `git_remote`, when it is a server's directory).
+    pub git_dir: Option<PathBuf>,
+    pub git_remote: Option<String>,
+    /// The state should be read again (the directory was read again, something was done).
+    pub git_want: bool,
+    /// A read is on its way.
+    pub git_busy: bool,
+    /// What the plugins' columns answered for this panel's folder: column id → (the folder, name → pieces of (text, colour)).
+    pub plugin_cells: std::collections::HashMap<String, (PathBuf, std::collections::HashMap<String, Vec<(String, String)>>)>,
+    /// The folder the plugins' columns were asked for, and whether they are to be asked again (the folder was read again).
+    pub cells_dir: Option<PathBuf>,
+    pub cells_want: bool,
 }
 
 impl Panel {
@@ -110,6 +126,15 @@ impl Panel {
             last_in: Default::default(),
             error: None,
             notice: None,
+            git: None,
+            git_base: String::new(),
+            git_dir: None,
+            git_remote: None,
+            git_want: true,
+            git_busy: false,
+            plugin_cells: Default::default(),
+            cells_dir: None,
+            cells_want: true,
         };
         p.reload();
         p
@@ -187,6 +212,8 @@ impl Panel {
     pub fn reload(&mut self) {
         let keep = self.current().map(|e| e.name.clone());
         self.error = None;
+        self.git_want = true;
+        self.cells_want = true;
         match &self.place {
             Place::Dir(d) => {
                 match fsx::list_dir(d, self.hidden, self.sort, self.reverse) {

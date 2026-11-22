@@ -26,6 +26,22 @@
 //! other panel's directory. The same reach the command as `$LVC_FILE`, `$LVC_FILES` (one per line),
 //! `$LVC_DIR`, `$LVC_OTHER_DIR`.
 //!
+//! A BUTTON of its own: an action may sit in the bottom bar, in a group of keys (the key groups are `t m a y p f g o x r v`; a letter
+//! that is none of them makes a new group of the plugin's):
+//!
+//! ```toml
+//! [actions.lint]
+//! title        = "lint"
+//! call         = "lint"
+//! group        = "x"                # the group the button is in (`group_title` names a group of the plugin's own)
+//! sub          = "a"                # optional: the sub-group in it (`sub_title` names one of the plugin's own)
+//! button       = "l"                # the key of the button there
+//! ```
+//!
+//! A COLUMN of its own: `[columns.<id>]` with `title` and `call` (a function of the plugin): lvc calls it with the folder and its names
+//! (`{"call":…,"column":"plugin.id","dir":…,"names":[…]}`) and the answer is `{"op":"cells","column":"plugin.id","dir":…,"cells":{"name":[["text","colour"],…]}}`;
+//! the column is in the columns list (`vc`) with the built-in ones, where it can be moved and turned off.
+//!
 //! A `control` command talks back: each line it prints is an instruction —
 //! `cd PATH`, `other-cd PATH`, `select NAME`, `mark NAME`, `reload`, `message TEXT`, `error TEXT`.
 //!
@@ -71,10 +87,33 @@ pub struct Action {
     pub call: Option<String>,
     pub mode: Mode,
     pub reload: bool,
+    /// Where its button is in the bottom bar, when it has one.
+    pub slot: Option<Slot>,
     /// "config", or the plugin it comes from.
     pub source: String,
     /// The plugin's directory ($LVC_PLUGIN_DIR).
     pub dir: Option<PathBuf>,
+}
+
+/// Where an action's button is: the group (and sub-group) of keys and the key there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Slot {
+    pub group: char,
+    pub sub: Option<char>,
+    pub key: char,
+    pub group_title: Option<String>,
+    pub sub_title: Option<String>,
+}
+
+/// A column a plugin brings (`[columns.<id>]`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColumnDef {
+    /// `plugin.id`
+    pub id: String,
+    pub title: String,
+    pub plugin: String,
+    /// The plugin function that answers with the cells.
+    pub call: String,
 }
 
 #[derive(Clone, Debug)]
@@ -275,12 +314,21 @@ pub fn parse_actions(
             },
         };
         for k in a.keys() {
-            if !["title", "key", "command", "call", "mode", "reload"].contains(&k.as_str()) {
+            if !["title", "key", "command", "call", "mode", "reload", "group", "group_title", "sub", "sub_title", "button"].contains(&k.as_str()) {
                 errs.push(format!(
-                    "{at}: actions.{id}: unknown key `{k}` (title, key, command, call, mode, reload)"
+                    "{at}: actions.{id}: unknown key `{k}` (title, key, command, call, mode, reload, group, group_title, sub, sub_title, button)"
                 ));
             }
         }
+        let one = |k: &str| s(k).and_then(|v| (v.chars().count() == 1).then(|| v.chars().next().unwrap_or(' ')));
+        let slot = match (one("group"), one("button")) {
+            (Some(group), Some(key)) => Some(Slot { group, sub: one("sub"), key, group_title: s("group_title"), sub_title: s("sub_title") }),
+            (None, None) => None,
+            _ => {
+                errs.push(format!("{at}: actions.{id}: a button needs `group` and `button`, each one character"));
+                None
+            }
+        };
         out.push(Action {
             id: id.clone(),
             title: s("title").unwrap_or_else(|| id.clone()),
@@ -289,6 +337,7 @@ pub fn parse_actions(
             call,
             mode,
             reload: a.get("reload").and_then(|v| v.as_bool()).unwrap_or(false),
+            slot,
             source: source.to_string(),
             dir: dir.map(Path::to_path_buf),
         });
@@ -350,14 +399,36 @@ pub fn load_plugins(roots: &[PathBuf]) -> (Vec<Plugin>, Vec<Action>, Vec<Preview
                 // the providers a plugin offers every lvim tool (`[preview.<id>]`, `[open.<id>]`): the plugin host
                 // reads them (lvim_fuzzy_plugin::Registry), not lvc's own plugin loader
                 "preview" | "open" => {}
+                // the columns a plugin brings: read by `load_columns`
+                "columns" => {}
                 other => errs.push(format!(
-                    "{at}: unknown key `{other}` (name, description, runtime, hosts, api, version, author, license, repository, exec, events, library, module, allow_write, script, build, requires, config, actions, previewers, preview, open)"
+                    "{at}: unknown key `{other}` (name, description, runtime, hosts, api, version, author, license, repository, exec, events, library, module, allow_write, script, build, requires, config, actions, previewers, columns, preview, open)"
                 )),
             }
         }
         plugins.push(m.def);
     }
     (plugins, actions, previewers, errs)
+}
+
+/// The columns the plugins bring (`[columns.<id>]`): `plugin.id`, a title, and the plugin function that gives the cells.
+pub fn load_columns(roots: &[PathBuf]) -> Vec<ColumnDef> {
+    let (mans, _) = lvim_fuzzy_plugin::manifest::load_roots(roots, "lvim-fuzzy-commander");
+    let mut out = Vec::new();
+    for m in mans {
+        let Some(t) = m.table.get("columns").and_then(|v| v.as_table()) else { continue };
+        for (id, c) in t {
+            let Some(c) = c.as_table() else { continue };
+            let Some(call) = c.get("call").and_then(|v| v.as_str()) else { continue };
+            out.push(ColumnDef {
+                id: format!("{}.{id}", m.def.name),
+                title: c.get("title").and_then(|v| v.as_str()).unwrap_or(id).to_string(),
+                plugin: m.def.name.clone(),
+                call: call.to_string(),
+            });
+        }
+    }
+    out
 }
 
 /// `[keys]` of the app config over the actions: the plugins are loaded first, then the config moves their
@@ -488,6 +559,8 @@ pub enum Instr {
     Menu { title: String, items: Vec<MenuEntry> },
     /// Text (ANSI allowed) for the quick view.
     Preview(String),
+    /// The cells of a column a plugin brings, for the names of a folder: `[(text, colour)]` pieces each.
+    Cells { column: String, dir: PathBuf, cells: Vec<(String, Vec<(String, String)>)> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -565,6 +638,24 @@ pub fn parse_response(text: &str) -> Result<Vec<Instr>, String> {
                 Instr::Menu { title: get("title").unwrap_or("").to_string(), items: entries }
             }
             "preview" => Instr::Preview(need("text")?),
+            "cells" => {
+                let cells = it
+                    .get("cells")
+                    .and_then(|c| c.as_object())
+                    .map(|o| {
+                        o.iter()
+                            .map(|(name, segs)| {
+                                let segs = segs
+                                    .as_array()
+                                    .map(|a| a.iter().filter_map(|p| Some((p.get(0)?.as_str()?.to_string(), p.get(1).and_then(|c| c.as_str()).unwrap_or("").to_string()))).collect())
+                                    .unwrap_or_default();
+                                (name.clone(), segs)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Instr::Cells { column: need("column")?, dir: PathBuf::from(need("dir")?), cells }
+            }
             other => return Err(format!("instruction {i}: unknown op `{other}`")),
         });
     }
@@ -573,6 +664,32 @@ pub fn parse_response(text: &str) -> Result<Vec<Instr>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_action_may_have_a_button_and_a_plugin_may_have_a_column() {
+        let dir = std::env::temp_dir().join(format!("lvc-btn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("p")).unwrap();
+        std::fs::write(
+            dir.join("p/plugin.toml"),
+            "description = \"d\"\nruntime = \"process\"\nexec = \"./run\"\nhosts = [\"lvim-fuzzy-commander\"]\n[actions.lint]\ntitle = \"lint\"\ncall = \"lint\"\ngroup = \"x\"\nsub = \"a\"\nbutton = \"l\"\n[actions.own]\ntitle = \"mine\"\ncall = \"own\"\ngroup = \"k\"\ngroup_title = \"kit\"\nbutton = \"o\"\n[actions.bad]\ncall = \"b\"\ngroup = \"x\"\n[columns.size2]\ntitle = \"Size 2\"\ncall = \"cells\"\n",
+        )
+        .unwrap();
+        let (_, actions, _, errs) = load_plugins(&[dir.clone()]);
+        let lint = actions.iter().find(|a| a.id == "lint").unwrap();
+        assert_eq!(lint.slot, Some(Slot { group: 'x', sub: Some('a'), key: 'l', group_title: None, sub_title: None }));
+        let own = actions.iter().find(|a| a.id == "own").unwrap();
+        assert_eq!(own.slot.as_ref().and_then(|s| s.group_title.as_deref()), Some("kit"));
+        // a button needs both its group and its key
+        assert!(errs.iter().any(|e| e.contains("a button needs `group` and `button`")));
+        assert!(actions.iter().find(|a| a.id == "bad").unwrap().slot.is_none());
+        let cols = load_columns(&[dir.clone()]);
+        assert_eq!(cols, vec![ColumnDef { id: "p.size2".into(), title: "Size 2".into(), plugin: "p".into(), call: "cells".into() }]);
+        // the answer of a column function
+        let r = parse_response(r#"[{"op":"cells","column":"p.size2","dir":"/d","cells":{"a.txt":[["12","green"],["K","comment"]]}}]"#).unwrap();
+        assert!(matches!(&r[0], Instr::Cells { column, dir, cells } if column == "p.size2" && dir == std::path::Path::new("/d") && cells[0].0 == "a.txt" && cells[0].1.len() == 2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     #[test]
@@ -749,6 +866,7 @@ mod tests {
             call: None,
             mode: Mode::Silent,
             reload: false,
+            slot: None,
             source: source.into(),
             dir: None,
         };

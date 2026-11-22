@@ -1,6 +1,10 @@
 //! The application: two panels (Midnight Commander style), the quick view, the dialogs, the jobs, and the
 //! keys that drive them.
 
+mod buttons;
+mod gitops;
+use gitops::{DiffView, GITDIRECT, GITSUBS};
+use lvim_fuzzy_plugin_git::ops::Repo;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::time::{Duration, Instant};
@@ -61,6 +65,20 @@ enum InputAction {
     RemoteRename { remote: String, path: String },
     /// the buffer pasted with a target the user edits (may end in a rename mask); `cut`: the buffer is emptied
     PasteTo(Vec<PathBuf>, bool),
+    /// the message of a git commit (`amend`: of the one it replaces)
+    GitCommit { repo: Repo, amend: bool },
+    /// a tag at the head: its name, and after a space a message (an annotated tag)
+    GitTag { repo: Repo },
+    /// the name of a new git branch, switched to
+    GitNewBranch { repo: Repo },
+    /// the message of a stash (empty: git's own)
+    GitStash { repo: Repo },
+    /// a name for the place the panel is in, kept as a bookmark (`remote`: it is a directory of that remote)
+    BookmarkAdd { remote: Option<String>, path: String },
+    /// a new name for a kept bookmark
+    BookmarkRename { old: String },
+    /// a tracked path renamed with `git mv`: the new name in the same directory (`base` from the work tree's top)
+    GitMove { repo: Repo, base: String, from: String },
 }
 
 /// A row of the info dialog: a label and the value's pieces, each with the theme colour it is drawn in (`mode`: the
@@ -104,6 +122,16 @@ enum ConfirmAction {
     SiteDelete(String),
     Purge(Vec<crate::trash::Item>),
     EmptyTrash,
+    /// give up the changes of these paths (tracked ones go back to the index, untracked ones are deleted)
+    GitDiscard { repo: Repo, tracked: Vec<String>, untracked: Vec<String> },
+    /// `git rm` these
+    GitRemove { repo: Repo, paths: Vec<String> },
+    GitDeleteBranch { repo: Repo, name: String },
+    GitDropStash { repo: Repo, name: String },
+    /// give up the merge / rebase / cherry-pick / revert in progress
+    GitAbort { repo: Repo, state: String, label: String },
+    /// give up one hunk of the work tree (its patch), then show the diff again
+    GitDiscardHunk { view: DiffView, patch: String },
 }
 
 enum Dialog {
@@ -196,6 +224,24 @@ enum MenuItem {
     /// Another instance (Ctrl-c I), then what to do with it.
     Peer(crate::instances::Peer),
     PeerDo(crate::instances::Peer, PeerDo),
+    /// A kept place: Enter goes there, `o` in the other panel, `d` deletes it, `r` renames it.
+    Bookmark(crate::config::Bookmark),
+    /// A git branch: Enter switches to it (a remote one gets a local branch), `d` deletes it.
+    GitBranch { repo: Repo, name: String, remote: bool, current: bool },
+    /// A commit of the log: Enter shows what it changed.
+    GitCommit { repo: Repo, hash: String, subject: String },
+    /// A stash: Enter pops it, `a` applies, `d` drops, `v` shows it.
+    GitStash { repo: Repo, name: String },
+    /// A branch to merge into the current one (Enter).
+    GitMerge { repo: Repo, name: String },
+    /// A branch to rebase the current one onto (Enter).
+    GitRebase { repo: Repo, name: String },
+    /// Resolve conflicted paths: `how` 0 ours, 1 theirs, 2 mark them as they are.
+    GitResolve { repo: Repo, paths: Vec<String>, how: u8 },
+    /// A tag: Enter shows it, `c` switches to it, `p` pushes it, `d` deletes it.
+    GitTag { repo: Repo, name: String },
+    /// A submodule: Enter goes into it, `u` updates it, `U` all of them.
+    GitModule { repo: Repo, path: String },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -266,6 +312,7 @@ const CHORDS: &[(&str, &str, u8, &str)] = &[
     (";", "file info", 0, "info"),
     ("G", "my computer", 0, "local"),
     ("Z", "zoom", 0, "zoom"),
+    ("B", "bookmark", 0, "bookmark-add"),
     ("V", "view file", 0, "viewer"),
     ("R", "refresh", 0, "refresh"),
     ("U", "redo", 0, "redo"),
@@ -332,13 +379,14 @@ const GROUPS: &[(char, &str, &[(&str, &str)])] = &[
     ]),
     ('f', "find", &[("f", "find"), ("g", "grep")]),
     ('g', "go", &[
-        ("g", "top"), ("c", "goto"), ("b", "bookmarks"), ("t", "trash-view"), ("[", "back"), ("]", "forward"),
+        ("g", "top"), ("c", "goto"), ("b", "bookmarks"), ("a", "bookmark-add"), ("t", "trash-view"), ("[", "back"), ("]", "forward"),
         ("o", "dir-to-other"), ("i", "here-to-other"), ("G", "local"), ("?", "keys-help"),
     ]),
     ('o', "operations", &[
         ("c", "copy"), ("m", "move"), ("r", "refresh"), ("R", "rename-tab"), ("N", "rename"), ("s", "here-to-other"), ("n", "new"), ("e", "edit"), ("d", "trash"), ("D", "delete"),
         ("o", "menu"), ("t", "tasks"),
     ]),
+    ('x', "git", &[]),
     ('r', "remote", &[("c", "remote-list"), ("l", "remote-list"), ("a", "remote-add"), ("e", "remote-edit"), ("d", "remote-delete")]),
     ('v', "view", &[
         ("v", "view"), ("i", "info"), ("z", "zoom"), ("f", "viewer"), ("d", "compare"), ("b", "sync"), ("c", "columns"), ("l", "long"), ("h", "hidden"), ("s", "sort"), ("S", "reverse"),
@@ -525,27 +573,63 @@ enum GroupHit {
     Command(KeyCode),
     /// an F-key action (`view`): its own F-key
     Fkey(KeyEvent),
+    /// a command of group `x` (git)
+    Git(&'static str),
+    /// a sub-group of the group: its key
+    Sub(char),
+    /// a button a plugin put there: its action
+    Plugin(usize),
     None,
 }
 
 impl App {
-    fn group_command(&self, g: char, c: char) -> GroupHit {
-        if g == 't' && ('1'..='9').contains(&c) {
+    fn group_command(&self, g: char, sub: Option<char>, c: char) -> GroupHit {
+        if g == 't' && sub.is_none() && ('1'..='9').contains(&c) {
             return GroupHit::Tab(c as usize - '1' as usize);
         }
-        let Some((_, _, keys)) = GROUPS.iter().find(|(n, _, _)| *n == g) else { return GroupHit::None };
-        let Some((_, name)) = keys.iter().find(|(k, _)| k.chars().next() == Some(c)) else { return GroupHit::None };
-        if *name == "top" {
-            return GroupHit::Top;
+        // the git group: sub-groups of commands, then commands right in it
+        if g == 'x' {
+            match sub {
+                None => {
+                    if let Some(s) = GITSUBS.iter().find(|s| s.key == c) {
+                        return if self.git_sub_avail(s) { GroupHit::Sub(c) } else { GroupHit::None };
+                    }
+                    if let Some((_, n, _)) = GITDIRECT.iter().find(|(k, _, _)| k.chars().next() == Some(c)) {
+                        return GroupHit::Git(n);
+                    }
+                }
+                Some(sk) => {
+                    if let Some((_, n, _)) = GITSUBS.iter().find(|s| s.key == sk).and_then(|s| s.items.iter().find(|(k, _, _)| k.chars().next() == Some(c))) {
+                        return GroupHit::Git(n);
+                    }
+                }
+            }
+        } else if sub.is_none() {
+            if let Some((_, _, keys)) = GROUPS.iter().find(|(n, _, _)| *n == g)
+                && let Some((_, name)) = keys.iter().find(|(k, _)| k.chars().next() == Some(c))
+            {
+                if *name == "top" {
+                    return GroupHit::Top;
+                }
+                if let Some((_, _, canon)) = self.fkeys.iter().find(|(n, _, _)| n == name) {
+                    return GroupHit::Fkey(KeyEvent::new(canon.code, canon.modifiers));
+                }
+                if let Some((_, def)) = crate::config::COMMANDS.iter().find(|(n, _)| n == name) {
+                    return match crate::plugins::KeySpec::parse(def) {
+                        Some(ks) => GroupHit::Command(ks.code),
+                        None => GroupHit::None,
+                    };
+                }
+            }
         }
-        if let Some((_, _, canon)) = self.fkeys.iter().find(|(n, _, _)| n == name) {
-            return GroupHit::Fkey(KeyEvent::new(canon.code, canon.modifiers));
+        // what plugins put in the group: a button, or a sub-group of their own
+        if let Some(i) = self.slot_action(g, sub, c) {
+            return GroupHit::Plugin(i);
         }
-        let Some((_, def)) = crate::config::COMMANDS.iter().find(|(n, _)| n == name) else { return GroupHit::None };
-        match crate::plugins::KeySpec::parse(def) {
-            Some(ks) => GroupHit::Command(ks.code),
-            None => GroupHit::None,
+        if sub.is_none() && self.slot_subs(g).iter().any(|(k, _)| *k == c) {
+            return GroupHit::Sub(c);
         }
+        GroupHit::None
     }
 }
 
@@ -723,6 +807,15 @@ pub struct App {
     /// Background actions finishing.
     act_tx: Sender<ActionDone>,
     act_rx: Receiver<ActionDone>,
+    /// The sub-group of the open key group (`x a`: git files).
+    sub: Option<char>,
+    /// What the git reads in the background found: (the directory, its work tree's state).
+    git_tx: Sender<GitMsg>,
+    git_rx: Receiver<GitMsg>,
+    /// The columns the plugins bring (`[columns.<id>]`), asked for the names of each folder shown.
+    columns: Vec<crate::plugins::ColumnDef>,
+    /// A text on the whole screen (a diff, a commit): lines with their colour from the first character; shown by the viewer.
+    view_text: Option<ViewText>,
     /// Previewer outputs by (previewer, path).
     pv_out: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>>,
     /// The query field has the keys (Ctrl-f / `/`); otherwise letters are commands (j / k ...).
@@ -768,6 +861,7 @@ impl App {
     ) -> App {
         let (wake_tx, wake_rx) = channel();
         let (act_tx, act_rx) = channel();
+        let (git_tx, git_rx) = channel();
         let mut notes = notes;
         let mut host = lvim_fuzzy_plugin::Host::new(plugin_defs, wake_tx.clone());
         // every plugin's settings: its defaults, the shared file, then lvc's own [plugins.<name>]
@@ -821,6 +915,11 @@ impl App {
             previewers,
             act_tx,
             act_rx,
+            sub: None,
+            git_tx,
+            git_rx,
+            view_text: None,
+            columns: Vec::new(),
             host,
             plug,
             plug_wait: None,
@@ -904,6 +1003,201 @@ impl App {
         });
     }
 
+    /// The columns plugins bring: the plugins' functions are asked for the names of each folder shown (again when it is read again).
+    pub fn set_columns(&mut self, cols: Vec<crate::plugins::ColumnDef>) {
+        for c in &cols {
+            // a column the state file does not know yet joins the list, on
+            self.cols.ensure(&c.id, true);
+        }
+        self.columns = cols;
+    }
+
+    fn columns_sync(&mut self) {
+        if self.columns.is_empty() {
+            return;
+        }
+        for i in 0..2 {
+            let dir = match (&self.panels[i].place, self.panels[i].archive.is_some()) {
+                (Place::Dir(d), false) => d.clone(),
+                _ => continue,
+            };
+            if self.panels[i].cells_dir.as_deref() != Some(dir.as_path()) {
+                self.panels[i].cells_dir = Some(dir.clone());
+                self.panels[i].cells_want = true;
+            }
+            if !self.panels[i].cells_want {
+                continue;
+            }
+            self.panels[i].cells_want = false;
+            let names: Vec<String> = self.panels[i].entries.iter().filter(|e| !e.is_parent()).map(|e| e.name.clone()).collect();
+            for c in self.columns.clone() {
+                if !self.cols.get(&c.id) {
+                    continue;
+                }
+                let ctx = serde_json::json!({"call": c.call, "column": c.id, "dir": dir, "names": names});
+                if let Err(e) = self.host.call(&c.plugin, &c.call, ctx, std::slice::from_ref(&dir)) {
+                    self.toast(e, true);
+                }
+            }
+        }
+    }
+
+    /// The label of a column in the columns list: a built-in one, or the title a plugin gave its column.
+    fn col_label(&self, key: &str) -> String {
+        crate::config::Cols::label(key).map(str::to_string).or_else(|| self.columns.iter().find(|c| c.id == key).map(|c| format!("{} (plugin {})", c.title, c.plugin))).unwrap_or_else(|| key.to_string())
+    }
+
+    // ── git ─────────────────────────────────────────────────────────────────────────────────────────
+
+    /// The state of the git work tree under each panel: asked for in the background when a directory is new or was read again, and
+    /// kept while the next answer is on its way (so moving about a repository does not blink).
+    fn git_sync(&mut self) {
+        if !self.cfg.git {
+            return;
+        }
+        let mut asked: Vec<(Option<String>, PathBuf)> = Vec::new();
+        for i in 0..2 {
+            // where the panel is: a folder of this machine, or a folder of a server git can be run on (over ssh); nothing else has a work tree
+            let (remote, dir) = match (self.panels[i].place.clone(), self.panels[i].archive.is_some()) {
+                (Place::Dir(d), false) => (None, d),
+                // a server's folder: only once it is listed (the connection is made, the key is in the agent), and never asking for a secret
+                (Place::Remote { remote, path }, _) if !self.panels[i].loading && self.panels[i].error.is_none() && self.git_ssh_of(&remote).is_some() => (Some(remote), PathBuf::from(path)),
+                _ => {
+                    let p = &mut self.panels[i];
+                    p.git = None;
+                    p.git_dir = None;
+                    p.git_remote = None;
+                    continue;
+                }
+            };
+            let p = &mut self.panels[i];
+            if p.git_dir.as_deref() != Some(dir.as_path()) || p.git_remote != remote {
+                p.git_dir = Some(dir.clone());
+                p.git_remote = remote.clone();
+                // the same work tree: it stays on show, read again
+                match p.git.as_ref().and_then(|g| g.base(&dir)) {
+                    Some(b) => p.git_base = b,
+                    None => {
+                        p.git = None;
+                        p.git_base.clear();
+                    }
+                }
+                p.git_want = true;
+            }
+            if self.panels[i].git_want && !self.panels[i].git_busy {
+                self.panels[i].git_want = false;
+                self.panels[i].git_busy = true;
+                if asked.contains(&(remote.clone(), dir.clone())) {
+                    continue;
+                }
+                asked.push((remote.clone(), dir.clone()));
+                let ssh = remote.as_deref().and_then(|r| self.git_ssh_of(r));
+                let (tx, wake) = (self.git_tx.clone(), self.wake_tx.clone());
+                let ignored = self.cfg.git_ignored;
+                std::thread::spawn(move || {
+                    let state = match ssh {
+                        Some(t) => lvim_fuzzy_plugin_git::status::read_in(std::sync::Arc::new(lvim_fuzzy_plugin_git::runner::Ssh(t)), &dir.to_string_lossy(), ignored, "normal"),
+                        None => lvim_fuzzy_plugin_git::status::read(&dir, ignored, "normal"),
+                    };
+                    let _ = tx.send(GitMsg::Read(GitRead { dir, remote, state }));
+                    let _ = wake.send(());
+                });
+            }
+        }
+    }
+
+    /// What the background reads found goes into the panels that show that directory (those of the other tabs too).
+    fn git_pump(&mut self) {
+        while let Ok(msg) = self.git_rx.try_recv() {
+            match msg {
+                GitMsg::Read(done) => self.git_read_done(done),
+                GitMsg::Done { label, result } => {
+                    match result {
+                        Ok(t) if t.trim().is_empty() => self.toast(format!("{label}: done"), false),
+                        Ok(t) => self.toast(format!("{label}: {}", t.lines().next().unwrap_or("")), false),
+                        Err(e) => self.toast(format!("{label}: {}", e.lines().next().unwrap_or("failed")), true),
+                    }
+                    // the state changed: the panels read their directories and git again
+                    for p in &mut self.panels {
+                        p.reload();
+                    }
+                }
+                GitMsg::Text { title, result } => match result {
+                    Ok(t) if t.trim().is_empty() => self.toast(format!("{title}: nothing to show"), false),
+                    Ok(t) => {
+                        self.view_text = Some(ViewText { title, lines: t.lines().map(str::to_string).collect(), diff: None });
+                        self.viewer = true;
+                        self.pv_off = 0;
+                    }
+                    Err(e) => self.toast(format!("{title}: {e}"), true),
+                },
+                GitMsg::Diff { view, result } => match result {
+                    Ok(t) if t.trim().is_empty() => {
+                        // nothing left of it: all of it is staged (or given up)
+                        let n = view.path.clone();
+                        self.close_viewer();
+                        self.toast(format!("{n}: no more changes here"), false);
+                        for p in &mut self.panels {
+                            p.reload();
+                        }
+                    }
+                    Ok(t) => {
+                        let lines: Vec<String> = t.lines().map(str::to_string).collect();
+                        let hs = lvim_fuzzy_plugin_git::ops::hunks(&lines);
+                        let mut view = view;
+                        view.hunk = view.hunk.min(hs.len().saturating_sub(1));
+                        self.pv_off = hs.get(view.hunk).map_or(0, |h| h.start);
+                        let title = format!("{} {}  ·  hunk {}/{}", if view.staged { "staged diff" } else { "diff" }, view.path, view.hunk + 1, hs.len().max(1));
+                        self.view_text = Some(ViewText { title, lines, diff: Some(view) });
+                        self.viewer = true;
+                        for p in &mut self.panels {
+                            p.reload();
+                        }
+                    }
+                    Err(e) => self.toast(format!("git: {e}"), true),
+                },
+                GitMsg::List { title, result } => match result {
+                    Ok(items) if items.is_empty() => self.toast(format!("{title}: nothing"), false),
+                    Ok(items) => self.dialog = Some(Dialog::Menu { title, items, sel: 0 }),
+                    Err(e) => self.toast(format!("{title}: {e}"), true),
+                },
+            }
+        }
+    }
+
+    fn git_read_done(&mut self, done: GitRead) {
+        let state = match done.state {
+            Ok(Some(st)) => Some(std::sync::Arc::new(st)),
+            Ok(None) => None,
+            // a server that git could not be read on (no key in the agent, no git there): no marks, and no noise
+            Err(e) if done.remote.is_some() => {
+                let _ = e;
+                None
+            }
+            Err(e) => {
+                self.toast(format!("git: {e}"), true);
+                None
+            }
+        };
+        let mut fill = |p: &mut Panel| {
+            if p.git_dir.as_deref() != Some(done.dir.as_path()) || p.git_remote != done.remote {
+                return;
+            }
+            p.git_busy = false;
+            p.git_base = state.as_ref().and_then(|g| g.base(&done.dir)).unwrap_or_default();
+            p.git = state.clone();
+        };
+        self.panels.iter_mut().for_each(&mut fill);
+        self.tabs.iter_mut().flatten().for_each(|t| t.panels.iter_mut().for_each(&mut fill));
+    }
+
+    /// Ask again for the state of every panel (after an operation, or at the user's wish).
+    fn git_refresh(&mut self) {
+        for p in &mut self.panels {
+            p.git_want = true;
+        }
+    }
+
     // ── the loop ────────────────────────────────────────────────────────────────────────────────────
 
     pub fn run(mut self, term: &mut Term) -> std::io::Result<Outcome> {
@@ -937,6 +1231,9 @@ impl App {
             self.pump_job();
             self.remote_sync();
             self.pump_remote();
+            self.git_sync();
+            self.git_pump();
+            self.columns_sync();
             if !self.after_fetch.is_empty() {
                 self.run_after_fetch(term)?;
             }
@@ -1211,6 +1508,9 @@ impl App {
 
     /// How many pages / points the file in the viewer has (1: none to move among).
     fn viewer_positions(&self) -> u32 {
+        if self.view_text.is_some() {
+            return 1;
+        }
         let Some(path) = self.p().current_path().or_else(|| self.viewer_cache()) else { return 1 };
         match self.plug_answers.get(&(path, self.plug_skip)) {
             Some(lvim_fuzzy_ui::provided::Answer::Preview(p)) => p.positions,
@@ -1228,6 +1528,10 @@ impl App {
 
     /// The top / the end of what the viewer shows: a Neovim preview gets `gg` / `G`, the built-in one moves its offset.
     fn preview_edge(&mut self, top: bool) {
+        if self.view_text.is_some() {
+            self.pv_off = if top { 0 } else { usize::MAX / 2 };
+            return;
+        }
         let cur = self.pcur().map(|p| p.to_string_lossy().into_owned());
         if let Some(nv) = &self.nvim {
             let shown = nv.grid.lock().unwrap().shown.clone();
@@ -1243,12 +1547,19 @@ impl App {
     /// video, g / G the top / the end, Esc / q / Enter / vf close.
     fn viewer_key(&mut self, k: KeyEvent) -> std::io::Result<()> {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        match k.code {
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('f') | KeyCode::Char('V') if !ctrl => {
-                self.viewer = false;
-                self.pv_off = 0;
-                self.drawer.forget();
+        // a diff on the screen has keys of its own: the hunks
+        if !ctrl && self.view_text.is_some() {
+            let c = match k.code {
+                KeyCode::Char(c) => Some(c),
+                KeyCode::Tab => Some('\t'),
+                _ => None,
+            };
+            if let Some(c) = c && self.hunk_key(c) {
+                return Ok(());
             }
+        }
+        match k.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('f') | KeyCode::Char('V') if !ctrl => self.close_viewer(),
             KeyCode::Char('q') if ctrl => self.quit = true,
             // up onto the tab bar, down onto the button bar, as everywhere
             KeyCode::Char('k') if ctrl && self.tabs.len() > 1 => self.tab_focus = Some(self.tab),
@@ -1443,13 +1754,20 @@ impl App {
                 if !matches!(k.code, KeyCode::Left | KeyCode::Right) {
                     self.footer_off = 0;
                 }
+                let sub = self.sub.take();
                 match k.code {
-                    KeyCode::Esc => {}
+                    // Esc in a sub-group goes up to the group, in the group it closes it
+                    KeyCode::Esc => {
+                        if sub.is_some() {
+                            self.group = Some(g);
+                        }
+                    }
                     KeyCode::Left | KeyCode::Right => {
                         self.group = Some(g);
+                        self.sub = sub;
                         self.footer_scroll(if k.code == KeyCode::Left { -1 } else { 1 });
                     }
-                    KeyCode::Char(c) => match self.group_command(g, c) {
+                    KeyCode::Char(c) => match self.group_command(g, sub, c) {
                         GroupHit::Top => {
                             self.pm().cursor = 0;
                             self.pv_follow();
@@ -1470,6 +1788,13 @@ impl App {
                             self.synthetic = true;
                             return self.key(ev, term);
                         }
+                        GroupHit::Git(name) => self.git_op(name),
+                        GroupHit::Sub(s) => {
+                            // into the sub-group: the bar shows its buttons
+                            self.group = Some(g);
+                            self.sub = Some(s);
+                        }
+                        GroupHit::Plugin(i) => self.run_action(i, term)?,
                         GroupHit::None => self.toast(format!("{g} {c}: no such key"), true),
                     },
                     _ => {}
@@ -1477,10 +1802,12 @@ impl App {
                 return Ok(());
             }
             if let KeyCode::Char(c) = k.code
-                && GROUPS.iter().any(|(g, _, _)| *g == c)
+                && (GROUPS.iter().any(|(g, _, _)| *g == c) || self.slot_groups().iter().any(|(g, _)| *g == c))
+                && (c != 'x' || self.git_here())
                 && !self.help
             {
                 self.group = Some(c);
+                self.sub = None;
                 self.footer_off = 0;
                 return Ok(());
             }
@@ -1902,6 +2229,7 @@ impl App {
             KeyCode::Char('m') if chord => self.chmod(),
             KeyCode::Char('O') if chord => self.chown(),
             KeyCode::Char('b') if chord => self.bookmarks(),
+            KeyCode::Char('B') if chord => self.bookmark_add(),
             KeyCode::Char('e') if chord => self.extract(),
             KeyCode::Char('z') if chord => self.compress(),
             KeyCode::Char('q') if chord || ctrl => self.quit = true,
@@ -1966,7 +2294,7 @@ impl App {
                 TabSave { name: self.tab_names[i].clone(), panels: [panel(&panels[0]), panel(&panels[1])], active, quick }
             })
             .collect();
-        crate::config::State { quick: self.quick, cols: self.cols, tabs, tab: self.tab }
+        crate::config::State { quick: self.quick, cols: self.cols.clone(), tabs, tab: self.tab }
     }
 
     fn save_state(&mut self) {
@@ -2294,7 +2622,7 @@ impl App {
     /// The client of the remote plugin (the plugin is written into the shared directory first, as the others are).
     fn remote_client(&mut self) -> &mut lvim_fuzzy_plugin::Remote {
         if self.remote.is_none() {
-            lvim_fuzzy_plugin_remote::ensure_installed(&crate::config::plugins_dir());
+            crate::config::install_plugins(&self.cfg.plugins);
             let r = lvim_fuzzy_plugin::Remote::load(&crate::config::plugin_roots(), "lvim-fuzzy-commander", &self.cfg.plugins, self.wake_tx.clone());
             let cache_mb = r.config()["cache"].as_u64().unwrap_or(512);
             std::thread::spawn(move || lvim_fuzzy_plugin_remote::engine::prune_cache(cache_mb));
@@ -2843,10 +3171,10 @@ impl App {
 
     /// Ctrl-c l: permissions, owner and group together on / off (the "long" listing).
     fn toggle_long(&mut self) {
-        let on = !(self.cols.mode && self.cols.owner && self.cols.group);
-        self.cols.mode = on;
-        self.cols.owner = on;
-        self.cols.group = on;
+        let on = !(self.cols.get("mode") && self.cols.get("owner") && self.cols.get("group"));
+        self.cols.set("mode", on);
+        self.cols.set("owner", on);
+        self.cols.set("group", on);
         self.save_state();
     }
 
@@ -3043,6 +3371,12 @@ impl App {
     /// gets the keys (as lfz does), the built-in one moves its offset.
     fn scroll_preview(&mut self, n: isize, half: bool) {
         if !self.quick && !self.viewer {
+            return;
+        }
+        // a text of git: only its offset moves
+        if self.view_text.is_some() {
+            let step = if half { (self.term_rows / 2).max(1) as isize * n.signum() } else { n };
+            self.pv_off = (self.pv_off as isize + step).max(0) as usize;
             return;
         }
         let cur = self.pcur().map(|p| p.to_string_lossy().into_owned());
@@ -3274,6 +3608,14 @@ impl App {
                     self.dialog = Some(Dialog::Menu { title, items, sel: last });
                 }
                 KeyCode::Char('q') => {}
+                KeyCode::Char(c) => {
+                    let it = items.get(sel).map(|(_, it)| it.clone());
+                    // a git list has keys of its own (d delete, n new, a apply, v show); the list stays if the key is not one of them
+                    let taken = it.is_some_and(|it| self.menu_key(&it, c));
+                    if !taken {
+                        self.dialog = Some(Dialog::Menu { title, items, sel });
+                    }
+                }
                 _ => self.dialog = Some(Dialog::Menu { title, items, sel }),
             },
             Dialog::Conflict { target, answer } => {
@@ -3300,16 +3642,38 @@ impl App {
                 _ => self.dialog = Some(Dialog::Confirm { title, lines, action }),
             },
             Dialog::Columns { mut sel } => {
-                let n = crate::config::Cols::ALL.len();
+                let n = self.cols.list.len().max(1);
+                let shift = k.modifiers.contains(KeyModifiers::SHIFT);
                 match k.code {
                     KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => return Ok(()),
+                    // J / K (or Shift with the arrows, < >): the column moves in the order, and the cursor with it
+                    KeyCode::Char('J') | KeyCode::Char('>') => {
+                        sel = self.cols.move_by(sel, 1);
+                        self.save_state();
+                    }
+                    KeyCode::Char('K') | KeyCode::Char('<') => {
+                        sel = self.cols.move_by(sel, -1);
+                        self.save_state();
+                    }
+                    KeyCode::Down if shift => {
+                        sel = self.cols.move_by(sel, 1);
+                        self.save_state();
+                    }
+                    KeyCode::Up if shift => {
+                        sel = self.cols.move_by(sel, -1);
+                        self.save_state();
+                    }
                     KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab => sel = (sel + 1) % n,
                     KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab => sel = (sel + n - 1) % n,
                     KeyCode::Char(' ') | KeyCode::Char('x') => {
-                        let key = crate::config::Cols::ALL[sel].0;
-                        let on = !self.cols.get(key);
-                        self.cols.set(key, on);
-                        self.save_state();
+                        if let Some((key, on)) = self.cols.list.get(sel).cloned() {
+                            self.cols.set(&key, !on);
+                            self.save_state();
+                            // a plugin's column that was off is asked for now
+                            for p in &mut self.panels {
+                                p.cells_want = true;
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -3889,6 +4253,68 @@ impl App {
                 let n = self.pm().mark_glob(value.trim(), on);
                 self.toast(format!("{} {n}", if on { "marked" } else { "unmarked" }), false);
             }
+            InputAction::GitCommit { repo, amend } => {
+                let msg = value.trim().to_string();
+                let label = if amend { "git amend" } else { "git commit" };
+                self.git_spawn(label, move || lvim_fuzzy_plugin_git::ops::commit(&repo, &msg, amend));
+            }
+            InputAction::GitTag { repo } => {
+                let v = value.trim();
+                let (name, msg) = v.split_once(' ').map_or((v, ""), |(n, m)| (n, m.trim()));
+                if name.is_empty() {
+                    return Ok(());
+                }
+                let (name, msg) = (name.to_string(), msg.to_string());
+                self.git_spawn("git tag", move || lvim_fuzzy_plugin_git::ops::new_tag(&repo, &name, &msg).map(|_| format!("{name} at the head")));
+            }
+            InputAction::GitNewBranch { repo } => {
+                let name = value.trim().to_string();
+                if name.is_empty() {
+                    return Ok(());
+                }
+                self.git_spawn("git new branch", move || lvim_fuzzy_plugin_git::ops::new_branch(&repo, &name).map(|_| format!("on {name}")));
+            }
+            InputAction::GitStash { repo } => {
+                let msg = value.trim().to_string();
+                self.git_spawn("git stash", move || lvim_fuzzy_plugin_git::ops::stash_push(&repo, &msg, true));
+            }
+            InputAction::GitMove { repo, base, from } => {
+                let name = value.trim().to_string();
+                if name.is_empty() || name.contains('/') {
+                    self.toast("a name in the same folder (no /)", true);
+                    return Ok(());
+                }
+                let to = if base.is_empty() { name } else { format!("{base}/{name}") };
+                self.git_spawn("git mv", move || lvim_fuzzy_plugin_git::ops::rename(&repo, &from, &to).map(|_| String::new()));
+            }
+            InputAction::BookmarkAdd { remote, path } => {
+                let name = value.trim().to_string();
+                if name.is_empty() {
+                    return Ok(());
+                }
+                let mut list = crate::config::load_bookmarks();
+                list.retain(|b| b.name != name);
+                list.push(crate::config::Bookmark { name: name.clone(), remote, path });
+                match crate::config::save_bookmarks(&list) {
+                    Ok(()) => self.toast(format!("bookmarked: {name} (gb lists them)"), false),
+                    Err(e) => self.toast(e, true),
+                }
+            }
+            InputAction::BookmarkRename { old } => {
+                let name = value.trim().to_string();
+                if name.is_empty() {
+                    return Ok(());
+                }
+                let mut list = crate::config::load_bookmarks();
+                list.retain(|b| b.name != name);
+                if let Some(b) = list.iter_mut().find(|b| b.name == old) {
+                    b.name = name;
+                }
+                if let Err(e) = crate::config::save_bookmarks(&list) {
+                    self.toast(e, true);
+                }
+                self.bookmarks();
+            }
             InputAction::TabName => {
                 let name = value.trim();
                 let at = self.tab;
@@ -3978,6 +4404,24 @@ impl App {
                     }
                 }
                 self.after_trash_op(items.len(), errs, "deleted for good");
+            }
+            ConfirmAction::GitDiscard { repo, tracked, untracked } => {
+                self.git_spawn("git discard", move || lvim_fuzzy_plugin_git::ops::discard(&repo, &tracked, &untracked).map(|_| String::new()));
+            }
+            ConfirmAction::GitAbort { repo, state, label } => {
+                self.git_spawn(&label, move || lvim_fuzzy_plugin_git::ops::abort(&repo, &state).map(|_| String::new()));
+            }
+            ConfirmAction::GitDiscardHunk { view, patch } => {
+                self.hunk_apply(view, patch, lvim_fuzzy_plugin_git::ops::HunkDo::Discard);
+            }
+            ConfirmAction::GitRemove { repo, paths } => {
+                self.git_spawn("git rm", move || lvim_fuzzy_plugin_git::ops::remove(&repo, &paths).map(|_| String::new()));
+            }
+            ConfirmAction::GitDeleteBranch { repo, name } => {
+                self.git_spawn("git branch -D", move || lvim_fuzzy_plugin_git::ops::delete_branch(&repo, &name, true).map(|_| format!("{name} deleted")));
+            }
+            ConfirmAction::GitDropStash { repo, name } => {
+                self.git_spawn("git stash drop", move || lvim_fuzzy_plugin_git::ops::stash_drop(&repo, &name).map(|_| String::new()));
             }
             ConfirmAction::EmptyTrash => {
                 let items = crate::trash::list();
@@ -4128,6 +4572,25 @@ impl App {
                     action: ConfirmAction::SiteDelete(name),
                 });
             }
+            MenuItem::GitBranch { repo, name, remote, current } => {
+                if current {
+                    self.toast(format!("already on {name}"), false);
+                } else {
+                    let b = lvim_fuzzy_plugin_git::ops::Branch { name: name.clone(), current, remote, upstream: None, subject: String::new() };
+                    self.git_spawn("git switch", move || lvim_fuzzy_plugin_git::ops::checkout(&repo, &b).map(|_| format!("on {name}")));
+                }
+            }
+            MenuItem::GitCommit { repo, hash, subject } => {
+                self.git_text(&format!("{} {subject}", &hash[..hash.len().min(8)]), move || lvim_fuzzy_plugin_git::ops::show(&repo, &hash));
+            }
+            MenuItem::GitStash { repo, name } => {
+                self.git_spawn("git stash pop", move || lvim_fuzzy_plugin_git::ops::stash_pop(&repo, &name).map(|_| String::new()));
+            }
+            MenuItem::Bookmark(b) => {
+                let place = self.bookmark_place(&b);
+                self.pm().go(place);
+            }
+            it @ (MenuItem::GitMerge { .. } | MenuItem::GitRebase { .. } | MenuItem::GitResolve { .. } | MenuItem::GitTag { .. } | MenuItem::GitModule { .. }) => self.git_menu_pick(it),
             MenuItem::Action(i) => self.run_action(i, term)?,
             MenuItem::Builtin(b) => self.builtin(b, term)?,
             MenuItem::Peer(peer) => {
@@ -4519,6 +4982,14 @@ impl App {
                     self.panels[o].go(Place::Dir(p));
                 }
             }
+            Instr::Cells { column, dir, cells } => {
+                let map: std::collections::HashMap<String, Vec<(String, String)>> = cells.into_iter().collect();
+                for p in &mut self.panels {
+                    if p.dir() == Some(dir.as_path()) {
+                        p.plugin_cells.insert(column.clone(), (dir.clone(), map.clone()));
+                    }
+                }
+            }
             Instr::Select(n) => self.pm().select_name(&n),
             Instr::Mark(n) => {
                 if self.p().entries.iter().any(|e| e.name == n) {
@@ -4736,29 +5207,89 @@ impl App {
         self.dialog = Some(Dialog::Owner { paths: t, users, groups, user, group, members, remote: None, focus: 0, open: None });
     }
 
-    /// Alt-b: the bookmarks of the config, then the directories visited.
+    /// `gb`: the places kept with `ga`, then the bookmarks of the config, then the directories visited.
     fn bookmarks(&mut self) {
         let mut items: Vec<(String, MenuItem)> = Vec::new();
+        for b in crate::config::load_bookmarks() {
+            let at = match &b.remote {
+                Some(r) => format!("{r}:{}", b.path),
+                None => fsx::tilde(&self.resolve(&b.path)),
+            };
+            items.push((format!("★ {}  {at}", b.name), MenuItem::Bookmark(b)));
+        }
         let mut bm: Vec<(&String, &String)> = self.cfg.bookmarks.iter().collect();
         bm.sort();
         for (name, path) in bm {
             let p = self.resolve(path);
-            items.push((format!("{name}  {}", fsx::tilde(&p)), MenuItem::Dir(p)));
+            items.push((format!("  {name}  {}", fsx::tilde(&p)), MenuItem::Dir(p)));
         }
         for p in &self.recent {
             if !items.iter().any(|(_, q)| matches!(q, MenuItem::Dir(d) if d == p)) {
-                items.push((fsx::tilde(p), MenuItem::Dir(p.clone())));
+                items.push((format!("  {}", fsx::tilde(p)), MenuItem::Dir(p.clone())));
             }
         }
         if items.is_empty() {
-            self.toast("no bookmarks ([bookmarks] in the config) and no recent directories", false);
+            self.toast("no bookmarks yet: ga keeps the place you are in", false);
             return;
         }
         self.dialog = Some(Dialog::Menu {
-            title: "Bookmarks · recent".into(),
+            title: "Bookmarks · Enter go · o other panel · d delete · r rename".into(),
             items,
             sel: 0,
         });
+    }
+
+    /// `ga`: keep the place the panel is in under a name.
+    fn bookmark_add(&mut self) {
+        let (remote, path, name) = match &self.p().place {
+            Place::Dir(d) if self.p().archive.is_none() => (None, d.to_string_lossy().into_owned(), d.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "/".into())),
+            Place::Remote { remote, path } => {
+                let base = path.rsplit('/').find(|s| !s.is_empty()).unwrap_or("");
+                (Some(remote.clone()), path.clone(), if base.is_empty() { remote.clone() } else { format!("{remote}-{base}") })
+            }
+            _ => {
+                self.toast("nothing to keep here: go to a folder first", true);
+                return;
+            }
+        };
+        self.input("Bookmark — a name for this place", &name, InputAction::BookmarkAdd { remote, path });
+    }
+
+    /// Where a kept bookmark leads.
+    fn bookmark_place(&self, b: &crate::config::Bookmark) -> Place {
+        match &b.remote {
+            Some(r) => Place::Remote { remote: r.clone(), path: b.path.clone() },
+            None => Place::Dir(self.resolve(&b.path)),
+        }
+    }
+
+    /// The keys of a list besides Enter and the moves: of the bookmarks, then of the git lists. Returns whether the key was taken.
+    fn menu_key(&mut self, it: &MenuItem, c: char) -> bool {
+        let MenuItem::Bookmark(b) = it else { return self.git_menu_key(it, c) };
+        match c {
+            'd' => {
+                let mut list = crate::config::load_bookmarks();
+                list.retain(|x| x.name != b.name);
+                match crate::config::save_bookmarks(&list) {
+                    Ok(()) => self.toast(format!("{} removed from the bookmarks", b.name), false),
+                    Err(e) => self.toast(e, true),
+                }
+                // the list again, without it
+                self.bookmarks();
+                true
+            }
+            'r' => {
+                self.input("Bookmark — a new name", &b.name, InputAction::BookmarkRename { old: b.name.clone() });
+                true
+            }
+            'o' => {
+                let place = self.bookmark_place(b);
+                let o = 1 - self.active;
+                self.panels[o].go(place);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Alt-a: extract the archive under the cursor into `<other panel>/<archive stem>/`.
@@ -5325,10 +5856,14 @@ impl App {
         let area = Rect { x: 0, y: 1, w, h: h - 2 };
         let mid = w / 2;
         if self.viewer {
-            // the file under the cursor on the whole screen
+            // the file under the cursor on the whole screen (or the text git gave: a diff, a commit)
             let r = Rect { x: 1, y: area.y + 1, w: w.saturating_sub(2), h: area.h.saturating_sub(2) };
             self.list_rects = [Rect { x: 0, y: 0, w: 0, h: 0 }; 2];
-            self.draw_preview(&mut cv, &l, r);
+            if self.view_text.is_some() {
+                self.draw_text_view(&mut cv, &l, r);
+            } else {
+                self.draw_preview(&mut cv, &l, r);
+            }
         } else if self.zoom {
             // the active panel alone, the whole width; the other one is not drawn
             let r = Rect { x: 1, y: area.y + 1, w: w.saturating_sub(2), h: area.h.saturating_sub(2) };
@@ -5475,6 +6010,43 @@ impl App {
             }
         };
         let mut items: Vec<(String, String, char)> = Vec::new();
+        // the git group: its sub-groups and commands that make sense for what is under the cursor now
+        let sub = self.group.and(self.sub);
+        if self.group == Some('x') {
+            match sub {
+                None => {
+                    for s in GITSUBS {
+                        if self.git_sub_avail(s) {
+                            items.push((s.key.to_string(), s.label.to_string(), s.key));
+                        }
+                    }
+                    for (k, name, lab) in GITDIRECT {
+                        if self.git_avail(name) {
+                            items.push((k.to_string(), lab.to_string(), k.chars().next().unwrap_or(' ')));
+                        }
+                    }
+                }
+                Some(sk) => {
+                    if let Some(s) = GITSUBS.iter().find(|s| s.key == sk) {
+                        for (k, name, lab) in s.items {
+                            if self.git_avail(name) {
+                                items.push((k.to_string(), lab.to_string(), k.chars().next().unwrap_or(' ')));
+                            }
+                        }
+                    }
+                }
+            }
+            // and what plugins put in the group
+            for b in self.slot_buttons('x', sub) {
+                items.push((b.key.to_string(), b.label, b.key));
+            }
+            if sub.is_none() {
+                for (k, lab) in self.slot_subs('x') {
+                    items.push((k.to_string(), lab, k));
+                }
+            }
+            return items;
+        }
         // the viewer has its own buttons; what cannot be done with this file now is not offered
         if self.viewer {
             let pages = self.viewer_positions();
@@ -5485,10 +6057,21 @@ impl App {
                 items.push(("J".into(), "next page".into(), 'J'));
                 items.push(("K".into(), "previous page".into(), 'K'));
             }
+            // a diff on the screen: its hunks
+            for (k, lab, c) in self.hunk_buttons() {
+                items.push((k.into(), lab.into(), c));
+            }
             items.push(("q".into(), "close".into(), 'q'));
             return items;
         }
         if let Some(g) = self.group {
+            // a sub-group of a plugin's in a built-in group: only its buttons
+            if let Some(sk) = sub {
+                for b in self.slot_buttons(g, Some(sk)) {
+                    items.push((b.key.to_string(), b.label, b.key));
+                }
+                return items;
+            }
             if let Some((_, _, keys)) = GROUPS.iter().find(|(n, _, _)| *n == g) {
                 let place = if self.p().is_trash() { 2 } else { 1 };
                 let mut seen: Vec<&str> = Vec::new();
@@ -5512,9 +6095,28 @@ impl App {
                     items.push(("1-9".into(), "tab number".into(), '1'));
                 }
             }
+            // what plugins put in the group, and the sub-groups they make in it (their group of their own too)
+            for b in self.slot_buttons(g, None) {
+                if !items.iter().any(|(k, _, _)| *k == b.key.to_string()) {
+                    items.push((b.key.to_string(), b.label, b.key));
+                }
+            }
+            for (k, lab) in self.slot_subs(g) {
+                if !items.iter().any(|(kk, _, _)| *kk == k.to_string()) {
+                    items.push((k.to_string(), lab, k));
+                }
+            }
         } else {
             for (g, gname, _) in GROUPS {
+                // the git group is there where a work tree is
+                if *g == 'x' && !self.git_here() {
+                    continue;
+                }
                 items.push((g.to_string(), gname.to_string(), *g));
+            }
+            // the groups plugins make
+            for (g, title) in self.slot_groups() {
+                items.push((g.to_string(), title, g));
             }
         }
         items
@@ -5661,7 +6263,10 @@ impl App {
             }
             // Esc: a group that was opened closes first (the focus stays on the bar), then the bar is left; k / ↑ leave at once
             KeyCode::Esc if self.group.is_some() => {
-                self.group = None;
+                // a sub-group goes up to its group, a group closes
+                if self.sub.take().is_none() {
+                    self.group = None;
+                }
                 self.footer_off = 0;
                 self.footer_focus = Some(0);
             }
@@ -5728,9 +6333,19 @@ impl App {
             Place::Dir(d) => {
                 let p = &self.panels[i];
                 let fw = 2 + p.sort.label().len() as u16 + if p.reverse { 2 } else { 0 } + if p.hidden { 9 } else { 0 };
+                // the branch and the counts of the git work tree the directory is in, left of the order flags
+                let segs = p.git.as_ref().map(|g| git_bar(l, g, &f_dir)).unwrap_or_default();
+                let gw: u16 = segs.iter().map(|(t, _)| str_width(t) as u16).sum();
+                let gw = if r.w > fw + gw + 24 { gw } else { 0 };
                 {
                     let shown = p.archive.as_ref().and_then(|a| d.strip_prefix(&a.root).ok().map(|rel| a.archive.join(rel)));
-                    self.draw_path_bar(cv, l, r, &d, shown.as_deref(), None, fw + 1, active)
+                    self.draw_path_bar(cv, l, r, &d, shown.as_deref(), None, fw + 1 + gw, active)
+                }
+                if gw > 0 {
+                    let mut gx = r.x + r.w - fw - gw;
+                    for (t, st) in &segs {
+                        gx = cv.put(gx, r.y, t, *st, r.x + r.w);
+                    }
                 }
             }
             Place::Remote { remote, path } => {
@@ -5866,16 +6481,23 @@ impl App {
             if e.is_parent() {
                 continue;
             }
-            if self.cols.owner {
+            if self.cols.get("owner") {
                 owner_w = owner_w.max(str_width(&fsx::user_name(e.uid)).min(16));
             }
-            if self.cols.group {
+            if self.cols.get("group") {
                 group_w = group_w.max(str_width(&fsx::group_name(e.gid)).min(16));
             }
-            if self.cols.size {
+            if self.cols.get("size") {
                 size_w = size_w.max(str_width(&size_of(p, e).0));
             }
         }
+        // the columns in their order, and how wide each column a plugin brings is (the widest of what it answered)
+        let col_order: Vec<(String, bool)> = self.cols.list.clone();
+        let plugin_col_w: std::collections::HashMap<&str, usize> = p
+            .plugin_cells
+            .iter()
+            .map(|(k, (_, m))| (k.as_str(), m.values().map(|segs| segs.iter().map(|(t, _)| str_width(t)).sum::<usize>()).max().unwrap_or(0)))
+            .collect();
         for row in 0..list.h as usize {
             let idx = p.offset + row;
             let Some(&ei) = p.shown.get(idx) else { break };
@@ -5896,62 +6518,87 @@ impl App {
             let mut x = cv.put(list.x, y, if marked { "➤" } else { " " }, Style { bg: base.bg, ..l.marker }, lim);
             // the columns right of the name (Ctrl-c v), each in its own colour; the narrowest panel drops
             // them from the least needed (group, owner, permissions, type, date, size) so the name keeps room
-            let mut cells: Vec<(&str, String, Style)> = Vec::new();
+            let mut cells: Vec<Cell> = Vec::new();
             if !e.is_parent() {
-                let c = self.cols;
                 let tb = base.bg;
-                if c.kind && !p.is_trash() {
-                    let (t, colour) = if e.broken {
-                        ("BRK", "red")
-                    } else if matches!(e.kind, Kind::Link | Kind::LinkDir) {
-                        ("LNK", "cyan")
-                    } else if e.is_dir() {
-                        ("DIR", "blue")
-                    } else if e.is_exec() {
-                        ("EXE", "green")
-                    } else {
-                        ("FILE", "comment")
-                    };
-                    cells.push(("kind", format!("{t:<4}"), tint(l, colour, base, tb)));
-                }
-                if c.mode && !p.is_trash() {
-                    cells.push(("mode", fsx::mode_string(e), base));
-                }
-                if c.owner && !p.is_trash() {
-                    let u = fsx::user_name(e.uid);
-                    let st = tint(l, if e.uid == 0 { "red" } else { "orange" }, base, tb);
-                    cells.push(("owner", format!("{:<owner_w$}", truncate(&u, 16)), st));
-                }
-                if c.group && !p.is_trash() {
-                    cells.push((
-                        "group",
-                        format!("{:<group_w$}", truncate(&fsx::group_name(e.gid), 16)),
-                        tint(l, "teal", base, tb),
-                    ));
-                }
-                if c.size {
-                    // a directory: how many entries it holds, in parentheses (a size it has not)
-                    let (txt, colour) = size_of(p, e);
-                    cells.push(("size", format!("{txt:>size_w$}"), tint(l, colour, base, tb)));
-                }
-                if c.date {
-                    let (txt, t) = if p.is_trash() {
-                        let it = p.trash_items.get(ei);
-                        (it.map(|t| t.deleted.replace('T', " ").chars().take(16).collect()).unwrap_or_default(), e.mtime)
-                    } else {
-                        (fsx::date_string(e.mtime), e.mtime)
-                    };
-                    cells.push(("date", txt, tint(l, age_colour(t), base, tb)));
+                // in the order the columns are in (`vc`: J / K move one), each in its own colour
+                for (id, on) in &col_order {
+                    if !*on {
+                        continue;
+                    }
+                    match id.as_str() {
+                        "git" => {
+                            // the two letters of `git status -s` (the index, the work tree) while the folder is in a work tree
+                            if let Some(g) = &p.git {
+                                let m = g.mark(&p.git_base, &e.name, e.is_dir());
+                                let (a, b) = (m.map_or(' ', |m| m.x), m.map_or(' ', |m| m.y));
+                                cells.push(Cell::segs("git", vec![(a.to_string(), git_style(l, a, 0, base)), (b.to_string(), git_style(l, b, 1, base))]));
+                            }
+                        }
+                        "kind" if !p.is_trash() => {
+                            let (t, colour) = if e.broken {
+                                ("BRK", "red")
+                            } else if matches!(e.kind, Kind::Link | Kind::LinkDir) {
+                                ("LNK", "cyan")
+                            } else if e.is_dir() {
+                                ("DIR", "blue")
+                            } else if e.is_exec() {
+                                ("EXE", "green")
+                            } else {
+                                ("FILE", "comment")
+                            };
+                            cells.push(Cell::text("kind", format!("{t:<4}"), tint(l, colour, base, tb)));
+                        }
+                        "mode" if !p.is_trash() => cells.push(Cell::text("mode", fsx::mode_string(e), base)),
+                        "owner" if !p.is_trash() => {
+                            let u = fsx::user_name(e.uid);
+                            let st = tint(l, if e.uid == 0 { "red" } else { "orange" }, base, tb);
+                            cells.push(Cell::text("owner", format!("{:<owner_w$}", truncate(&u, 16)), st));
+                        }
+                        "group" if !p.is_trash() => {
+                            cells.push(Cell::text("group", format!("{:<group_w$}", truncate(&fsx::group_name(e.gid), 16)), tint(l, "teal", base, tb)));
+                        }
+                        "size" => {
+                            // a directory: how many entries it holds, in parentheses (a size it has not)
+                            let (txt, colour) = size_of(p, e);
+                            cells.push(Cell::text("size", format!("{txt:>size_w$}"), tint(l, colour, base, tb)));
+                        }
+                        "date" => {
+                            let (txt, t) = if p.is_trash() {
+                                let it = p.trash_items.get(ei);
+                                (it.map(|t| t.deleted.replace('T', " ").chars().take(16).collect()).unwrap_or_default(), e.mtime)
+                            } else {
+                                (fsx::date_string(e.mtime), e.mtime)
+                            };
+                            cells.push(Cell::text("date", txt, tint(l, age_colour(t), base, tb)));
+                        }
+                        // a column a plugin brings: what it answered for this folder (nothing yet: no cell)
+                        other if other.contains('.') => {
+                            if let Some(segs) = p.plugin_cells.get(other).filter(|(d, _)| p.dir() == Some(d.as_path())).and_then(|(_, m)| m.get(&e.name)) {
+                                let w = plugin_col_w.get(other).copied().unwrap_or(0);
+                                let mut v: Vec<(String, Style)> = segs.iter().map(|(t, c)| (t.clone(), tint(l, c, base, tb))).collect();
+                                let used: usize = v.iter().map(|(t, _)| str_width(t)).sum();
+                                if used < w {
+                                    v.push((" ".repeat(w - used), base));
+                                }
+                                cells.push(Cell::segs(&format!("x:{other}"), v));
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
-            let width = |cells: &[(&str, String, Style)]| -> u16 {
-                cells.iter().map(|c| str_width(&c.1) as u16 + 2).sum::<u16>() + if cells.is_empty() { 0 } else { 1 }
-            };
+            let width = |cells: &[Cell]| -> u16 { cells.iter().map(|c| c.width() + 2).sum::<u16>() + if cells.is_empty() { 0 } else { 1 } };
+            // the narrowest panel drops them from the least needed so the name keeps room: the plugins' columns first, then group,
+            // owner, permissions, type, date, size; the git letters stay
+            if lim.saturating_sub(x) < width(&cells) + 14 {
+                cells.retain(|c| !c.key.starts_with("x:"));
+            }
             for drop in ["group", "owner", "mode", "kind", "date", "size"] {
                 if lim.saturating_sub(x) >= width(&cells) + 14 {
                     break;
                 }
-                cells.retain(|c| c.0 != drop);
+                cells.retain(|c| c.key != drop);
             }
             let rw = width(&cells);
             let name_lim = lim.saturating_sub(rw).max(x);
@@ -6008,9 +6655,13 @@ impl App {
                 cv.put(x, y, &format!(" → {t}"), tint(l, "cyan", base, base.bg), name_lim);
             }
             let mut cx = lim - rw;
-            for (key, txt, st) in &cells {
+            for c in &cells {
                 cx = cv.put(cx, y, "  ", base, lim);
-                cx = if *key == "mode" { put_mode(cv, l, cx, y, txt, base, lim) } else { cv.put(cx, y, txt, *st, lim) };
+                cx = match &c.segs {
+                    Some(segs) => segs.iter().fold(cx, |cx, (t, st)| cv.put(cx, y, t, *st, lim)),
+                    None if c.key == "mode" => put_mode(cv, l, cx, y, &c.text, base, lim),
+                    None => cv.put(cx, y, &c.text, c.st, lim),
+                };
             }
             if !cells.is_empty() {
                 cv.put(cx, y, " ", base, lim);
@@ -6376,20 +7027,20 @@ impl App {
                 hints(cv, l, r.x, r.y + rows.len() as u16 + 1, lim, &[("x", "cancel"), ("j/k", "move"), ("Esc", "close")]);
             }
             Dialog::Columns { sel } => {
-                let all = crate::config::Cols::ALL;
-                let lw = all.iter().map(|(_, lab)| str_width(lab)).max().unwrap_or(10) as u16;
+                let all: Vec<(String, bool, String)> = self.cols.list.iter().map(|(k, on)| (k.clone(), *on, self.col_label(k))).collect();
+                let lw = all.iter().map(|(_, _, lab)| str_width(lab)).max().unwrap_or(10) as u16;
                 let r = self.popup(cv, l, (w, h), (lw + 12, all.len() as u16 + 4), "Columns");
                 let lim = r.x + r.w;
-                let on = Style { fg: l.theme.color("green").or(text.fg), ..text };
+                let on_st = Style { fg: l.theme.color("green").or(text.fg), ..text };
                 let dim = Style { bg: l.popup.bg, ..l.count };
-                for (i, (key, lab)) in all.iter().enumerate() {
+                for (i, (key, set, lab)) in all.iter().enumerate() {
                     let y = r.y + i as u16;
-                    let set = self.cols.get(key);
                     let row = if i == *sel { l.sel[0] } else { text };
                     cv.fill(Rect { x: r.x, y, w: r.w, h: 1 }, row);
-                    let tst = if i == *sel { row } else if set { on } else { dim };
-                    let x = cv.put(r.x, y, if set { "[x] " } else { "[ ] " }, tst, lim);
-                    let colour = match *key {
+                    let tst = if i == *sel { row } else if *set { on_st } else { dim };
+                    let x = cv.put(r.x, y, if *set { "[x] " } else { "[ ] " }, tst, lim);
+                    let colour = match key.as_str() {
+                        "git" => "magenta",
                         "kind" => "blue",
                         "mode" => "yellow",
                         "owner" => "orange",
@@ -6400,7 +7051,7 @@ impl App {
                     let lst = if i == *sel { row } else { tint(l, colour, text, text.bg) };
                     cv.put(x, y, lab, lst, lim);
                 }
-                hints(cv, l, r.x, r.y + all.len() as u16 + 1, lim, &[("Space", "tick"), ("j/k", "move"), ("Esc", "close")]);
+                hints(cv, l, r.x, r.y + all.len() as u16 + 1, lim, &[("Space", "tick"), ("J/K", "move column"), ("j/k", "choose"), ("Esc", "close")]);
             }
             Dialog::Owner { paths, users, groups, user, group, members, focus, open, .. } => {
                 let title = format!("Owner · {} item(s)", paths.len());
@@ -6730,7 +7381,8 @@ const HELP_KEYS: &[(&str, &str)] = &[
         ("y …", "yank: y copy the files to the buffer · x cut them · p path(s) · n name(s) · d the panel's directory (text, to the clipboard)"),
         ("p …", "paste the buffer: p here · o other panel · c as copies · r with a new name / mask · l symbolic links · h hard links · m the clipboard's paths · v what is in it · d empty it"),
         ("f …", "find: f files · g grep (lvim-fuzzy)"),
-        ("g …", "go: gg top · G back to this machine from a remote · c directory · b bookmarks · t the trash · [ ] back / forward · o i dir → other panel · ? this help (the bar scrolls with ← → when it is longer than the screen)"),
+        ("g …", "go: gg top · G back to this machine from a remote · c directory · b bookmarks (Enter go · o other panel · d delete · r rename) · a keep this place as a bookmark · t the trash · [ ] back / forward · o i dir → other panel · ? this help (the bar scrolls with ← → when it is longer than the screen)"),
+        ("x …", "git (the group is there in a work tree; a button that makes no sense for what is under the cursor is not shown): s stage · u unstage · d discard · a stage all · U unstage all · c commit · C amend · f diff · l log of the item · L log of the repository (Enter shows a commit) · b branches (Enter switch · d delete · n new) · n new branch · F fetch · p pull · P push · t stash · T stashes (Enter pop · a apply · v show · d drop) · i ignore · r git rm · m git mv · R read git again. The two letters before a name are `git status -s`: the index (green) and the work tree; the bar shows the branch, ↑ ahead ↓ behind, +staged ~changed ?untracked !conflicts"),
         ("r …", "remote connections: c / l the list — Enter connects, or disconnects a connected one · a new (a form) · e change · d delete; a remote is left by disconnecting, not by h / Backspace; its title bar is red; on a remote panel the keys are the usual ones (oc om on oN od …)"),
         ("v …", "view: v quick view · i info · d compare the panels · b synchronized browsing · c columns · l long · h hidden · s sort · S reverse · w swap panels · r reload · H hints"),
         ("hjkl · / · Space · .", "move · search · mark · hidden files"),
@@ -6802,6 +7454,35 @@ fn relative_path(from: &Path, to: &Path) -> PathBuf {
 }
 
 /// A tab that is not the current one.
+/// The answer of a background read of git: for this directory, the state of its work tree (`None`: it is in none).
+struct GitRead {
+    dir: PathBuf,
+    /// the server the directory is on, when it is a server's
+    remote: Option<String>,
+    state: Result<Option<lvim_fuzzy_plugin_git::status::Status>, String>,
+}
+
+/// What a background git call brings back.
+enum GitMsg {
+    Read(GitRead),
+    /// An operation is done: its label and what it said (or why it failed).
+    Done { label: String, result: Result<String, String> },
+    /// A text to read (a diff, a commit).
+    Text { title: String, result: Result<String, String> },
+    /// A diff of a file, with its hunks: shown (or, when there is nothing left of it, the viewer is left).
+    Diff { view: DiffView, result: Result<String, String> },
+    /// A list to pick from (the log, the branches, the stashes).
+    List { title: String, result: Result<Vec<(String, MenuItem)>, String> },
+}
+
+/// A text shown by the viewer (see `App::view_text`).
+struct ViewText {
+    title: String,
+    lines: Vec<String>,
+    /// When the text is a diff of one file: where it came from, and the current hunk.
+    diff: Option<DiffView>,
+}
+
 struct TabState {
     panels: [Panel; 2],
     active: usize,
@@ -6933,6 +7614,74 @@ fn title_word(_l: &Look, bar: &Style) -> Style {
     // (a terminal palette that puts both on the same colour gets black text)
     let fg = if bar.bg == bar.fg { Some(crossterm::style::Color::Black) } else { bar.bg };
     Style { fg, bg: bar.fg, attrs: Attributes::from(a), ..*bar }
+}
+
+/// One cell of a row's columns: a text in one style, or pieces each in its own.
+struct Cell {
+    key: String,
+    text: String,
+    st: Style,
+    segs: Option<Vec<(String, Style)>>,
+}
+
+impl Cell {
+    fn text(key: &str, text: String, st: Style) -> Cell {
+        Cell { key: key.to_string(), text, st, segs: None }
+    }
+
+    fn segs(key: &str, segs: Vec<(String, Style)>) -> Cell {
+        Cell { key: key.to_string(), text: segs.iter().map(|(t, _)| t.as_str()).collect(), st: Style::default(), segs: Some(segs) }
+    }
+
+    fn width(&self) -> u16 {
+        str_width(&self.text) as u16
+    }
+}
+
+/// The colour of a git column's letter: the index column is green (it is going into the next commit), the work tree's tells what is the
+/// matter; conflicts are red whichever column.
+fn git_style(l: &Look, c: char, col: u8, base: Style) -> Style {
+    let colour = match (c, col) {
+        (' ', _) => return base,
+        ('U', _) | ('D', 1) => "red",
+        (_, 0) => "green",
+        ('M', _) => "yellow",
+        ('A', _) => "green",
+        ('R', _) => "cyan",
+        ('?', _) => "teal",
+        ('!', _) => "comment",
+        _ => "yellow",
+    };
+    tint(l, colour, base, base.bg)
+}
+
+/// The git part of a path bar: the branch, how far it is ahead of / behind its upstream, and the counts (staged, changed, untracked,
+/// in conflict), each in its colour. The text of each piece starts with a space.
+fn git_bar(l: &Look, g: &lvim_fuzzy_plugin_git::status::Status, bar: &Style) -> Vec<(String, Style)> {
+    let mut v: Vec<(String, Style)> = Vec::new();
+    let st = |colour: &str| tint(l, colour, *bar, bar.bg);
+    let branch = match &g.branch {
+        Some(b) => b.clone(),
+        None => format!("({})", g.oid.chars().take(7).collect::<String>()),
+    };
+    v.push((format!(" \u{e0a0} {branch}"), st("magenta")));
+    // a merge / rebase / cherry-pick / revert in progress
+    if let Some(state) = &g.state {
+        v.push((format!(" {}", state.to_uppercase()), Style { attrs: crossterm::style::Attributes::from(Attribute::Bold), ..st("red") }));
+    }
+    if g.ahead > 0 {
+        v.push((format!(" ↑{}", g.ahead), st("green")));
+    }
+    if g.behind > 0 {
+        v.push((format!(" ↓{}", g.behind), st("red")));
+    }
+    for (n, sign, colour) in [(g.staged, "+", "green"), (g.changed, "~", "yellow"), (g.untracked, "?", "teal"), (g.conflicted, "!", "red")] {
+        if n > 0 {
+            v.push((format!(" {sign}{n}"), st(colour)));
+        }
+    }
+    v.push((" ".into(), *bar));
+    v
 }
 
 /// The gap between two buttons of a bar as thin as a cell allows: a one-eighth block in the bar's colour over the next button's own,

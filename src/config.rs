@@ -54,6 +54,10 @@ pub struct Config {
     pub preview: PreviewKind,
     pub nvim: String,
     pub pool: bool,
+    /// The git marks and the git operations (the git plugin); off: nothing is read from git.
+    pub git: bool,
+    /// Mark ignored files too (dimmed); off is quicker in a tree with a big ignored folder.
+    pub git_ignored: bool,
     /// Alt-b: a name → a directory (`~` allowed).
     pub bookmarks: HashMap<String, String>,
     /// File icons: Material images where the terminal takes them (auto), always glyphs (font).
@@ -93,6 +97,8 @@ impl Default for Config {
             preview: PreviewKind::Nvim,
             nvim: "nvim".into(),
             pool: true,
+            git: true,
+            git_ignored: true,
             bookmarks: HashMap::new(),
             actions: Vec::new(),
             previewers: Vec::new(),
@@ -116,6 +122,17 @@ fn config_home() -> PathBuf {
 /// per plugin, each with a `plugin.toml`. `lvim-plugin install <git-url>` puts plugins here.
 pub fn plugins_dir() -> PathBuf {
     lvim_fuzzy_plugin::default_root()
+}
+
+/// Install the plugins that ship inside lvc — only the ones the config asks for (`[plugins.<name>] install = "bundled"`, or the path of a
+/// program; see `lvim_fuzzy_plugin::bundled::Install`): the preview, open, remote and git plugins. Nothing is written by itself.
+pub fn install_plugins(plugins: &toml::Table) {
+    use lvim_fuzzy_plugin::bundled::install_configured;
+    let root = plugins_dir();
+    install_configured(&root, plugins, "lvim-fuzzy-plugin-preview", lvim_fuzzy_plugin_preview::ensure_installed);
+    install_configured(&root, plugins, "lvim-fuzzy-plugin-open", lvim_fuzzy_plugin_open::ensure_installed);
+    install_configured(&root, plugins, "lvim-fuzzy-plugin-remote", lvim_fuzzy_plugin_remote::ensure_installed);
+    install_configured(&root, plugins, "lvim-fuzzy-plugin-git", lvim_fuzzy_plugin_git::ensure_installed);
 }
 
 /// `~/.config/lvim-commander/plugins`: where lvc's plugins lived before the shared directory; still read (after
@@ -210,6 +227,14 @@ pub fn load_from(p: &std::path::Path) -> (Config, Vec<String>) {
                             Some(b) => c.pool = b,
                             None => bad(&mut errs, "true or false"),
                         },
+                        "git" => match val.as_bool() {
+                            Some(b) => c.git = b,
+                            None => bad(&mut errs, "true or false"),
+                        },
+                        "git_ignored" => match val.as_bool() {
+                            Some(b) => c.git_ignored = b,
+                            None => bad(&mut errs, "true or false"),
+                        },
                         "open" => errs.push(format!(
                             "{}: [open] is gone: which program opens a file is the open plugin's configuration now — \
                              [plugins.lvim-fuzzy-plugin-open.types.<group>] (ext / mime / kind, engine) and \
@@ -277,7 +302,7 @@ pub fn load_from(p: &std::path::Path) -> (Config, Vec<String>) {
                             _ => bad(&mut errs, "a table of tables: [plugins.<plugin name>]"),
                         },
                         other => errs.push(format!(
-                            "{}: unknown key `{other}` (theme, keys, delete, hidden, editor, preview, nvim, pool, icons, zellij_images, bookmarks, actions, previewers, plugins)",
+                            "{}: unknown key `{other}` (theme, keys, delete, hidden, editor, preview, nvim, pool, git, git_ignored, icons, zellij_images, bookmarks, actions, previewers, plugins)",
                             p.display()
                         )),
                     }
@@ -294,6 +319,45 @@ pub fn load_from(p: &std::path::Path) -> (Config, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_columns_are_an_ordered_list_that_the_state_keeps() {
+        let mut c = Cols::default();
+        assert_eq!(c.list[0], ("git".to_string(), true));
+        assert!(c.get("size") && !c.get("kind"));
+        // J / K: the git letters go after the type
+        let at = c.move_by(0, 1);
+        assert_eq!((at, c.list[1].0.as_str()), (1, "git"));
+        // a plugin's column joins at the end, once
+        c.ensure("p.size2", true);
+        c.ensure("p.size2", false);
+        assert_eq!(c.list.last().unwrap(), &("p.size2".to_string(), true));
+        // saved and read back: order and on / off
+        c.set("size", false);
+        let on: Vec<String> = c.list.iter().filter(|(_, on)| *on).map(|(k, _)| k.clone()).collect();
+        let order: Vec<String> = c.list.iter().map(|(k, _)| k.clone()).collect();
+        assert_eq!(Cols::from_state(Some(order), Some(on)), c);
+        // an old state file (only what is on): the built-in order, those on
+        let old = Cols::from_state(None, Some(vec!["size".into()]));
+        assert!(old.get("size") && !old.get("date") && !old.get("git"));
+        // a column the file does not know is on when it is on by default
+        let new = Cols::from_state(Some(vec!["kind".into()]), None);
+        assert_eq!(new.list[0].0, "kind");
+        assert!(new.get("git") && new.get("date") && !new.get("kind"));
+    }
+
+    #[test]
+    fn bookmarks_are_kept_in_a_file_and_read_back() {
+        let list = vec![
+            Bookmark { name: "work".into(), remote: None, path: "/home/me/work".into() },
+            Bookmark { name: "box".into(), remote: Some("neterra".into()), path: "/srv/app".into() },
+        ];
+        let text = render_bookmarks(&list);
+        assert_eq!(parse_bookmarks(&text), list);
+        // a broken file is no bookmarks, not a crash
+        assert!(parse_bookmarks("[[bookmark\nname=").is_empty());
+        assert!(parse_bookmarks("").is_empty());
+    }
 
     /// A whole document, every key (toml 0.9 parses a `Value` as ONE value, not a file: the config was
     /// once read that way and every file failed).
@@ -374,6 +438,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("local", "leader G"),
     ("redo", "leader U"),
     ("zoom", "leader Z"),
+    ("bookmark-add", "leader B"),
     ("viewer", "leader V"),
     ("refresh", "leader R"),
     ("sync", "leader /"),
@@ -459,56 +524,92 @@ pub struct TabSave {
     pub quick: bool,
 }
 
-/// The columns beside a name, right of it: each on or off (Ctrl-c v).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The columns beside a name, right of it, in the order they are drawn, each on or off (`vc`; `J` / `K` move one in the list). The built-in ones
+/// and the ones plugins bring (`[columns.<id>]` in a `plugin.toml`, `<plugin>.<id>`).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cols {
-    pub kind: bool,
-    pub mode: bool,
-    pub owner: bool,
-    pub group: bool,
-    pub size: bool,
-    pub date: bool,
+    pub list: Vec<(String, bool)>,
 }
 
 impl Default for Cols {
     fn default() -> Cols {
-        Cols { kind: false, mode: false, owner: false, group: false, size: true, date: true }
+        Cols { list: Cols::BUILTIN.iter().map(|(k, _, on)| ((*k).to_string(), *on)).collect() }
     }
 }
 
 impl Cols {
-    /// (key, label) in the order they are drawn, left to right.
-    pub const ALL: [(&'static str, &'static str); 6] = [
-        ("kind", "type (DIR · EXE · LNK · BRK · FILE)"),
-        ("mode", "permissions (rwxr-xr-x)"),
-        ("owner", "owner"),
-        ("group", "group"),
-        ("size", "size (a directory: its entries, (23))"),
-        ("date", "date modified (deleted, in the trash)"),
+    /// (key, label, on by default) in the order they start in.
+    pub const BUILTIN: [(&'static str, &'static str, bool); 7] = [
+        ("git", "git status (the index and the work tree, in a work tree)", true),
+        ("kind", "type (DIR · EXE · LNK · BRK · FILE)", false),
+        ("mode", "permissions (rwxr-xr-x)", false),
+        ("owner", "owner", false),
+        ("group", "group", false),
+        ("size", "size (a directory: its entries, (23))", true),
+        ("date", "date modified (deleted, in the trash)", true),
     ];
 
     pub fn get(&self, key: &str) -> bool {
-        match key {
-            "kind" => self.kind,
-            "mode" => self.mode,
-            "owner" => self.owner,
-            "group" => self.group,
-            "size" => self.size,
-            "date" => self.date,
-            _ => false,
+        self.list.iter().any(|(k, on)| k == key && *on)
+    }
+
+    /// Turn a column on or off (a column not in the list yet joins it at the end).
+    pub fn set(&mut self, key: &str, on: bool) {
+        match self.list.iter_mut().find(|(k, _)| k == key) {
+            Some(e) => e.1 = on,
+            None => self.list.push((key.to_string(), on)),
         }
     }
 
-    pub fn set(&mut self, key: &str, on: bool) {
-        match key {
-            "kind" => self.kind = on,
-            "mode" => self.mode = on,
-            "owner" => self.owner = on,
-            "group" => self.group = on,
-            "size" => self.size = on,
-            "date" => self.date = on,
-            _ => {}
+    /// Make sure a column is in the list (a plugin's, the first time it is seen): at the end, with `on` as its state.
+    pub fn ensure(&mut self, key: &str, on: bool) {
+        if !self.list.iter().any(|(k, _)| k == key) {
+            self.list.push((key.to_string(), on));
         }
+    }
+
+    /// Move the column at `i` one place up (`d < 0`) or down; returns where it is now.
+    pub fn move_by(&mut self, i: usize, d: isize) -> usize {
+        let to = (i as isize + d).clamp(0, self.list.len() as isize - 1) as usize;
+        if to != i {
+            let e = self.list.remove(i);
+            self.list.insert(to, e);
+        }
+        to
+    }
+
+    /// The built-in label of a column.
+    pub fn label(key: &str) -> Option<&'static str> {
+        Cols::BUILTIN.iter().find(|(k, _, _)| *k == key).map(|(_, l, _)| *l)
+    }
+
+    /// From the state file: `order` (all the columns known, in order) and `on` (the ones that are on). A column the file does not know
+    /// is on when it is on by default; one that is in `on` only (an older file) joins the order at the end.
+    pub fn from_state(order: Option<Vec<String>>, on: Option<Vec<String>>) -> Cols {
+        let mut c = Cols::default();
+        if let Some(order) = &order {
+            let mut list: Vec<(String, bool)> = Vec::new();
+            for k in order {
+                if !list.iter().any(|(x, _)| x == k) {
+                    list.push((k.clone(), c.get(k)));
+                }
+            }
+            for (k, v) in &c.list {
+                if !list.iter().any(|(x, _)| x == k) {
+                    list.push((k.clone(), *v));
+                }
+            }
+            c.list = list;
+        }
+        if let Some(on) = on {
+            for (k, v) in &mut c.list {
+                *v = on.contains(k);
+            }
+            for k in &on {
+                c.ensure(k, true);
+            }
+        }
+        c
     }
 }
 
@@ -518,6 +619,70 @@ fn state_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| crate::fsx::home().join(".local/state"))
         .join("lvim-commander/state.toml")
+}
+
+/// A place the user keeps (`ga` adds the one the panel is in, `gb` lists them): a name, a directory, and the remote when it is a
+/// directory of one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Bookmark {
+    pub name: String,
+    pub remote: Option<String>,
+    pub path: String,
+}
+
+/// `$XDG_STATE_HOME/lvim-commander/bookmarks.toml`: shared by every lvc, written as the places are added and removed.
+pub fn bookmarks_path() -> PathBuf {
+    state_path().with_file_name("bookmarks.toml")
+}
+
+pub fn parse_bookmarks(text: &str) -> Vec<Bookmark> {
+    let Ok(t) = text.parse::<toml::Table>() else { return Vec::new() };
+    t.get("bookmark")
+        .and_then(toml::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|b| {
+                    Some(Bookmark {
+                        name: b.get("name")?.as_str()?.to_string(),
+                        path: b.get("path")?.as_str()?.to_string(),
+                        remote: b.get("remote").and_then(toml::Value::as_str).filter(|r| !r.is_empty()).map(str::to_string),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn render_bookmarks(list: &[Bookmark]) -> String {
+    let mut out = String::from("# The places kept in lvc (ga adds, gb lists; d deletes and r renames in the list).\n");
+    for b in list {
+        let mut t = toml::Table::new();
+        t.insert("name".into(), b.name.clone().into());
+        if let Some(r) = &b.remote {
+            t.insert("remote".into(), r.clone().into());
+        }
+        t.insert("path".into(), b.path.clone().into());
+        let mut top = toml::Table::new();
+        top.insert("bookmark".into(), toml::Value::Array(vec![toml::Value::Table(t)]));
+        out.push('\n');
+        out.push_str(&toml::to_string(&top).unwrap_or_default());
+    }
+    out
+}
+
+pub fn load_bookmarks() -> Vec<Bookmark> {
+    std::fs::read_to_string(bookmarks_path()).map(|t| parse_bookmarks(&t)).unwrap_or_default()
+}
+
+pub fn save_bookmarks(list: &[Bookmark]) -> Result<(), String> {
+    let p = bookmarks_path();
+    if let Some(d) = p.parent() {
+        std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+    }
+    // written beside and moved: another lvc never reads half a file
+    let tmp = p.with_extension(format!("toml.{}", std::process::id()));
+    std::fs::write(&tmp, render_bookmarks(list)).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &p).map_err(|e| format!("{}: {e}", p.display()))
 }
 
 /// The file buffer (`yy` / `yx`, then `pp` …): what was copied or cut, shared by every lvc.
@@ -587,13 +752,8 @@ pub fn load_state() -> State {
 
 fn state_from_text(text: &str) -> State {
     let t = toml::from_str::<toml::Table>(text).unwrap_or_default();
-    let mut cols = Cols::default();
-    if let Some(list) = t.get("columns").and_then(toml::Value::as_array) {
-        let on: Vec<&str> = list.iter().filter_map(toml::Value::as_str).collect();
-        for (k, _) in Cols::ALL {
-            cols.set(k, on.contains(&k));
-        }
-    }
+    let list = |k: &str| t.get(k).and_then(toml::Value::as_array).map(|a| a.iter().filter_map(toml::Value::as_str).map(str::to_string).collect::<Vec<_>>());
+    let cols = Cols::from_state(list("column_order"), list("columns"));
     let s = |t: &toml::Table, k: &str| t.get(k).and_then(toml::Value::as_str).unwrap_or("").to_string();
     let tabs: Vec<TabSave> = t
         .get("tabs")
@@ -625,10 +785,8 @@ fn state_from_text(text: &str) -> State {
 fn state_to_text(st: &State) -> String {
     let mut t = toml::Table::new();
     t.insert("quick".into(), st.quick.into());
-    t.insert(
-        "columns".into(),
-        toml::Value::Array(Cols::ALL.iter().filter(|(k, _)| st.cols.get(k)).map(|(k, _)| toml::Value::String((*k).into())).collect()),
-    );
+    t.insert("columns".into(), toml::Value::Array(st.cols.list.iter().filter(|(_, on)| *on).map(|(k, _)| toml::Value::String(k.clone())).collect()));
+    t.insert("column_order".into(), toml::Value::Array(st.cols.list.iter().map(|(k, _)| toml::Value::String(k.clone())).collect()));
     t.insert("tab".into(), (st.tab as i64).into());
     let tabs: Vec<toml::Value> = st
         .tabs

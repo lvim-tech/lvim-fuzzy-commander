@@ -53,6 +53,7 @@ fn main() {
     lvim_fuzzy_plugin_preview::run_if_asked(&args);
     lvim_fuzzy_plugin_open::run_if_asked(&args);
     lvim_fuzzy_plugin_remote::run_if_asked(&args);
+    lvim_fuzzy_plugin_git::run_if_asked(&args);
     // the other instances: list them, or send one (or all) an instruction
     match args.first().map(String::as_str) {
         Some("--list") => {
@@ -143,8 +144,7 @@ fn main() {
                         std::process::exit(2);
                     }
                 };
-                lvim_fuzzy_plugin_preview::ensure_installed(&config::plugins_dir());
-                lvim_fuzzy_plugin_open::ensure_installed(&config::plugins_dir());
+                config::install_plugins(&cfg.plugins);
                 let (wake, _rx) = std::sync::mpsc::channel();
                 let pl = lvim_fuzzy_plugin::Previewer::load(&config::plugin_roots(), "lvim-fuzzy-commander", &cfg.plugins, wake);
                 if pl.host().def(plugin).is_none() {
@@ -228,9 +228,8 @@ fn main() {
     // a parse error spans several lines (the source line and a caret): one dialog line each
     let notes: Vec<String> = notes.iter().flat_map(|n| n.lines().map(str::to_string)).collect();
     // the config's actions / previewers first (they win a shared key or extension), then the plugins'
-    // the preview plugin ships inside lvc: written into the shared plugins directory when it is not there yet
-    lvim_fuzzy_plugin_preview::ensure_installed(&config::plugins_dir());
-    lvim_fuzzy_plugin_open::ensure_installed(&config::plugins_dir());
+    // the plugins that ship inside lvc are written into the shared plugins directory only where the config says so
+    config::install_plugins(&cfg.plugins);
     let (p_defs, p_actions, p_previewers, perrs) = plugins::load_plugins(&config::plugin_roots());
     let mut notes = notes;
     notes.extend(perrs.iter().flat_map(|n| n.lines().map(str::to_string)));
@@ -248,6 +247,7 @@ fn main() {
     std::thread::spawn(|| lvim_fuzzy_ui::media::prune_cache(500 << 20));
     std::thread::spawn(app::prune_arcs);
     let mut app = app::App::new(cfg, look, left, right, notes, actions, previewers, p_defs);
+    app.set_columns(plugins::load_columns(&config::plugin_roots()));
     // started with no directory: the tabs open as they were left; with directories given, they are what you asked for
     if !explicit_dirs {
         app.restore_tabs(&config::load_state());
