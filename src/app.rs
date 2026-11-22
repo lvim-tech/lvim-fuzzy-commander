@@ -5411,12 +5411,17 @@ impl App {
         let rw = str_width(&right) as u16;
         let mut x = cv.put(0, 0, &truncate(&title, w.saturating_sub(rw + 1) as usize), title_word(l, &bar), w);
         // zoom mode (vz): said on the bar, in the yellow of the current tab, so it is never a mystery why one panel has the screen
-        // the modes that change what the panels show are said on the bar: zoom, the viewer (vf), the quick view (vv)
-        let modes: Vec<&str> = [(self.zoom, " ZOOM "), (self.viewer, " VIEW "), (self.quick && !self.viewer && !self.zoom, " PREVIEW ")]
-            .iter()
-            .filter(|(on, _)| *on)
-            .map(|(_, w)| *w)
-            .collect();
+        // the mode that has the screen is said on the bar, one at a time: the viewer (vf) over zoom (vz) over the quick view (vv); leaving
+        // the viewer shows the one under it again
+        let modes: Vec<&str> = if self.viewer {
+            vec![" VIEW "]
+        } else if self.zoom {
+            vec![" ZOOM "]
+        } else if self.quick {
+            vec![" PREVIEW "]
+        } else {
+            Vec::new()
+        };
         for word in modes {
             let mut a = l.footer_label.attrs;
             a.set(crossterm::style::Attribute::Bold);
