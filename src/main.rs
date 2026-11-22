@@ -50,10 +50,6 @@ lvcd() {\n  local d\n  d=\"$(command lvim-fuzzy-commander --print-dir \"$@\")\" 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // started to BE the preview plugin (a process the plugin host runs): answer as it, nothing else
-    lvim_fuzzy_plugin_preview::run_if_asked(&args);
-    lvim_fuzzy_plugin_open::run_if_asked(&args);
-    lvim_fuzzy_plugin_remote::run_if_asked(&args);
-    lvim_fuzzy_plugin_git::run_if_asked(&args);
     // the other instances: list them, or send one (or all) an instruction
     match args.first().map(String::as_str) {
         Some("--list") => {
@@ -136,15 +132,14 @@ fn main() {
                     eprintln!("lvim-fuzzy-commander: {e}");
                 }
                 let which = args.iter().skip_while(|x| *x != "--types").nth(1).map(String::as_str).unwrap_or("open");
-                let (plugin, builtin): (&str, &[(&str, Option<&str>)]) = match which {
-                    "open" => ("lvim-fuzzy-plugin-open", &lvim_fuzzy_plugin_open::BUILTIN_ENGINES),
-                    "preview" => ("lvim-fuzzy-plugin-preview", &lvim_fuzzy_plugin_preview::BUILTIN_ENGINES),
+                let plugin: &str = match which {
+                    "open" => "lvim-fuzzy-plugin-open",
+                    "preview" => "lvim-fuzzy-plugin-preview",
                     other => {
                         eprintln!("lvim-fuzzy-commander: --types open | preview, not `{other}`");
                         std::process::exit(2);
                     }
                 };
-                config::install_plugins(&cfg.plugins);
                 let (wake, _rx) = std::sync::mpsc::channel();
                 let pl = lvim_fuzzy_plugin::Previewer::load(&config::plugin_roots(), "lvim-fuzzy-commander", &cfg.plugins, wake);
                 if pl.host().def(plugin).is_none() {
@@ -152,7 +147,10 @@ fn main() {
                     std::process::exit(1);
                 }
                 println!("{plugin} — for lvc");
-                print!("{}", lvim_fuzzy_plugin::types::list(&pl.host().config_of(plugin), builtin, &lvim_fuzzy_plugin::have));
+                let conf = pl.host().config_of(plugin);
+                let builtin = lvim_fuzzy_plugin::types::builtin_engines(&conf);
+                let builtin: Vec<(&str, Option<&str>)> = builtin.iter().map(|(n, p)| (n.as_str(), p.as_deref())).collect();
+                print!("{}", lvim_fuzzy_plugin::types::list(&conf, &builtin, &lvim_fuzzy_plugin::have));
                 return;
             }
             "--plugins" => {
@@ -208,16 +206,54 @@ fn main() {
         }
     }
 
-    let (cfg, mut notes) = config::load();
+    // The configuration is checked BEFORE anything is drawn: a problem in the config, a plugin that is broken, a key that two things want —
+    // lvc does not start, it says what is wrong (a plugin that takes a key somebody has is an error, not a quiet winner).
+    let (cfg, mut errors) = config::load();
     // its own themes (lvim-colorscheme's extras/lvim_commander) first, then lvim-fuzzy's
     let mut dirs = vec![config::themes_dir()];
     dirs.extend(lvim_fuzzy_ui::lvim::theme_dirs());
     let (theme, note) = lvim_fuzzy_ui::lvim::resolve_theme_in(&dirs, cfg.theme.as_deref());
     if let Some(n) = note {
-        notes.push(n);
+        errors.push(n);
     }
     let look = lvim_fuzzy_ui::lvim::Look::new(theme);
-
+    // a plugin is a program of its own, installed by its own `scripts/install.sh` (or `lvim-fuzzy-plugin install`): lvc carries none of them
+    for (name, t) in &cfg.plugins {
+        if t.as_table().is_some_and(|t| t.contains_key("install")) {
+            errors.push(format!("[plugins.{name}] install is gone: a plugin is a program of its own — install it with its `scripts/install.sh` (it builds the program and writes the plugin into {}), and delete this line", config::plugins_dir().display()));
+        }
+    }
+    let (p_defs, p_actions, p_previewers, perrs) = plugins::load_plugins(&config::plugin_roots());
+    errors.extend(perrs);
+    // the config's actions first, then the plugins'
+    let mut actions = cfg.actions.clone();
+    actions.extend(p_actions);
+    // the plugins are loaded: the app's `[keys]` may now move their keys
+    plugins::apply_key_overrides(&mut actions, &cfg.keys, config::is_command, &mut errors);
+    // where every button is: the app's commands and the plugins' buttons in one map, with what the config moved; nobody takes what another has
+    let mut moves = cfg.positions.clone();
+    moves.extend(plugins::plugin_moves(&cfg.plugins, &p_defs, &config::plugins_dir(), &mut errors));
+    let (keymap, kerrs) = app::build_keymap(&actions, &moves, cfg.delete);
+    errors.extend(kerrs);
+    // the settings of the plugins: their defaults, the shared override file, lvc's own [plugins.<name>]
+    {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut host = lvim_fuzzy_plugin::Host::new(p_defs.clone(), tx);
+        errors.extend(host.configure_all(&config::plugins_dir(), &cfg.plugins));
+    }
+    if !errors.is_empty() {
+        eprintln!("lvim-fuzzy-commander: not started — {} problem{} in the configuration:", errors.len(), if errors.len() == 1 { "" } else { "s" });
+        for (i, e) in errors.iter().enumerate() {
+            let mut lines = e.lines();
+            eprintln!("  {}. {}", i + 1, lines.next().unwrap_or(""));
+            for l in lines {
+                eprintln!("     {l}");
+            }
+        }
+        eprintln!("Fix them and start again (`lvc --plugins` lists what is loaded).");
+        std::process::exit(2);
+    }
+    let notes: Vec<String> = Vec::new();
     let mut term = match term::Term::open() {
         Ok(t) => t,
         Err(e) => {
@@ -225,20 +261,6 @@ fn main() {
             std::process::exit(1);
         }
     };
-    // a parse error spans several lines (the source line and a caret): one dialog line each
-    let notes: Vec<String> = notes.iter().flat_map(|n| n.lines().map(str::to_string)).collect();
-    // the config's actions / previewers first (they win a shared key or extension), then the plugins'
-    // the plugins that ship inside lvc are written into the shared plugins directory only where the config says so
-    config::install_plugins(&cfg.plugins);
-    let (p_defs, p_actions, p_previewers, perrs) = plugins::load_plugins(&config::plugin_roots());
-    let mut notes = notes;
-    notes.extend(perrs.iter().flat_map(|n| n.lines().map(str::to_string)));
-    let mut actions = cfg.actions.clone();
-    actions.extend(p_actions);
-    // the plugins are loaded: the app's `[keys]` may now move their keys
-    let mut kerrs = Vec::new();
-    plugins::apply_key_overrides(&mut actions, &cfg.keys, config::is_command, &mut kerrs);
-    notes.extend(kerrs);
     let mut previewers = cfg.previewers.clone();
     previewers.extend(p_previewers);
     // icons as images: in raw mode, before input is read (it may ask the terminal its cell size)
@@ -248,6 +270,7 @@ fn main() {
     std::thread::spawn(app::prune_arcs);
     let mut app = app::App::new(cfg, look, left, right, notes, actions, previewers, p_defs);
     app.set_columns(plugins::load_columns(&config::plugin_roots()));
+    app.set_keymap(keymap);
     // started with no directory: the tabs open as they were left; with directories given, they are what you asked for
     if !explicit_dirs {
         app.restore_tabs(&config::load_state());

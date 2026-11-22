@@ -58,7 +58,7 @@ Status: early development.
 - Two modes: normal (`j` / `k`, `gg` / `G`, `h` / `l`, Space marks, `.` hidden files) and input
   (Ctrl-f or `/`: typing filters; Enter / Esc back).
 - `oo`: a menu of every operation and every user action; extensible — see [Extending](#extending).
-- Bookmarks and the recently visited directories (`gb`), go to a typed path (`gc`), a command run in the shell (`ax`), the shell under the
+- Bookmarks and the recently visited directories (`bl`, `ba` keeps one, `bd` deletes one), go to a typed path (`gc`), a command run in the shell (`ax`), the shell under the
   panels (`as` / `Ctrl-o`), the editor (`oe`), opening by extension (`[open]`, else the editor for
   text and `xdg-open` for the rest).
 
@@ -105,21 +105,24 @@ The groups (`Esc` leaves one):
 | `aL` · `au` | symbolic links to the marked in the other panel · undo the last operation |
 | `:` · `ax` | the **command line**: one row over the button bar, `dir $ command`; Enter types the command into the shell under the panels (in this panel's directory) and shows the shell — the output has your aliases, colours and icons; `Ctrl-o` comes back. `Tab` completes the word under the cursor — a command from `$PATH` for the first word, a path (relative to the panel's directory, `~/` too, spaces escaped) for the rest: the common start first, the candidates on the row above, `Tab` again goes through them. Up / Down recall the commands typed before (kept in `~/.local/state/lvim-commander/shell_history`), `Ctrl-u` clears, `Esc` closes |
 | `ar` · `aE` · `aq` | in the trash: restore · empty · quit |
-| `yy` `yx` | put the marked items (or the one under the cursor) into the **buffer**, to copy / to move; the marks go. The buffer is a file (`~/.local/state/lvim-commander/buffer.toml`), so every lvc sees it and it survives a restart |
+| `yy` `yx` | put the marked items (or the one under the cursor) into the **buffer**, to copy / to move; the marks go. The buffer is a file (`~/.local/state/lvim-commander/buffer.toml`), so every lvc sees it and it survives a restart On this machine `yy` / `yx` put the files themselves into the desktop clipboard too (`text/uri-list`, through `wl-copy` / `xclip`): a browser or a file manager pastes them (`clipboard_files = false` in the config turns it off). |
 | `pp` `po` `pc` | paste: into this directory · into the other panel's · as copies whatever the buffer holds (a cut buffer moves, and is emptied by `pp` / `po`) |
 | `pr` · `pl` `ph` | paste with the target as a field (a rename mask may end it) · as symbolic links (Tab: absolute / relative) · as hard links |
-| `pm` · `pv` `pd` | copy the paths in the system clipboard here (wl-paste / xclip) · what is in the buffer · empty it |
+| `pm` · `pv` `pd` | copy here what is in the system clipboard (wl-paste / xclip): files copied in another program (a file manager, a browser: `text/uri-list`, `file:///…%20…` read back) or paths as text · what is in the buffer · empty it |
 | `yp` `yn` `yd` | copy the path(s) · the name(s) · the panel's directory to the clipboard (text) |
 | `ff` `fg` | find files · grep (lvim-fuzzy) |
-| `x…` | **git** — a group with sub-groups, there where a work tree is (on this machine, or on an SSH server). A sub-group or a button that makes no sense for what is under the cursor (or is marked) is not shown. `xa` files: `a` add · `u` unstage · `d` discard (asks) · `r` remove (asks) · `i` ignore · `m` move · `A` add all · `U` unstage all. `xc` commit: `c` commit (asks the message) · `a` amend. `xd` inspect: `d` diff (hunks, see Git) · `l` log of the item · `L` log of the repository (Enter shows a commit) · `b` blame. `xb` branch: `l` list (Enter switches, `d` deletes, `n` new, `m` merge, `r` rebase) · `n` new · `m` merge · `r` rebase. `xp` sync: `f` fetch · `p` pull (fast-forward only) · `P` push. `xs` stash: `s` stash · `l` list (Enter pops, `a` applies, `v` shows, `d` drops). `xt` tags: `l` list (Enter shows, `c` switches, `p` pushes, `d` deletes) · `n` new (a name; a message after a space makes it an annotated one). `xS` submodules: `l` list (Enter goes in) · `u` update · `U` update all. `xm` **in progress** — only while a merge / rebase / cherry-pick / revert is: `c` continue · `a` abort (asks) · `r` resolve the conflicted file (ours · theirs · mark resolved). `xR` read git again. Fetch, pull, push and the rest run in the background and say how they ended |
+| `x…` | **git** — a group with sub-groups (made by the git plugin's `plugin.toml`; installed with `install`), there where a work tree is (on this machine, or on an SSH server). A sub-group or a button that makes no sense for what is under the cursor (or is marked) is not shown. `xa` files: `a` add · `u` unstage · `d` discard (asks) · `r` remove (asks) · `i` ignore · `m` move · `A` add all · `U` unstage all. `xc` commit: `c` commit (asks the message) · `a` amend. `xd` inspect: `d` diff (hunks, see Git) · `l` log of the item · `L` log of the repository (Enter shows a commit) · `b` blame. `xb` branch: `l` list (Enter switches, `d` deletes, `n` new, `m` merge, `r` rebase) · `n` new · `m` merge · `r` rebase. `xp` sync: `f` fetch · `p` pull (fast-forward only) · `P` push. `xs` stash: `s` stash · `l` list (Enter pops, `a` applies, `v` shows, `d` drops). `xt` tags: `l` list (Enter shows, `c` switches, `p` pushes, `d` deletes) · `n` new (a name; a message after a space makes it an annotated one). `xS` submodules: `l` list (Enter goes in) · `u` update · `U` update all. `xm` **in progress** — only while a merge / rebase / cherry-pick / revert is: `c` continue · `a` abort (asks) · `r` resolve the conflicted file (ours · theirs · mark resolved). `xR` read git again. Fetch, pull, push and the rest run in the background and say how they ended |
 | `rc` `rl` · `ra` · `re` · `rd` | the **remote connections** (FileZilla's site manager): a list of them with their state (`●` connected, `○` not): Enter connects, and on a connected one the button is **disconnect** — that is the only way out of a remote (`h` / Backspace / `..` stop at its top and say so), and it brings the panel back to its last folder on this machine; the **title bar is red** while the active panel is on a remote (`REMOTE` in the title; `h` at the top comes back) · make a new one in a form that asks in plain words (the kind of connection from a list: SFTP, FTP, an rclone remote, a server opened as a folder with sshfs, an rclone remote as a folder, a mount of your own; then the server from the hosts of `~/.ssh/config`, the key from `~/.ssh`, the remote from `rclone listremotes` — every such field opens a list with `Enter`, and you can type instead) · change one · delete one. They are written into `~/.config/lvim-plugins/lvim-fuzzy-plugin-remote.toml` (comments in it stay), so lfz sees them too; a password is never written — it is asked for when the server refuses the login, and kept for the session |
 | `gG` | from a remote back to your own folders — the panel returns to its last folder here and the connection stays open (`rc` opens it again, and disconnects) |
-| `gg` · `gc` `gb` · `gt` | top · go to a directory · bookmarks and recent · the trash |
-| `ga` | **bookmark** the place the panel is in (a folder of this machine, or a folder of a remote): asks for a name; they are kept in `$XDG_STATE_HOME/lvim-commander/bookmarks.toml`, shared by every lvc |
-| `gb` | the bookmark list: `★` the ones you kept, then the `[bookmarks]` of the config, then the recent folders. Enter goes there (a remote bookmark connects), `o` goes there in the other panel, `d` deletes a kept one, `r` renames it |
+| `gg` · `gc` · `gt` | top · go to a directory · the trash |
+| `gd` · `gu` · `ge` · `gC` | **devices** (the devices plugin's buttons, in `g`; installed with `install`): `gd` the disks and the gvfs mounts — Enter mounts what is not and goes into it; `gu` unmount; `ge` eject (a stick, a card, an external disk, a phone); `gC` connect to `smb://`, `sftp://`, `ftp://`, `dav://` with gvfs |
+| `vD` | **diff of two files** (the git plugin's button, in `v`): the two marked files, or the file under the cursor and the one of that name in the other panel, as a coloured text on the whole screen |
+| `xdc` | **the changes** (the git plugin's button): a flat list, with a search field, of what is changed or new in the work tree; Enter goes to the file |
+| `ba` · `bl` · `bd` · `br` | **bookmarks**: `ba` keeps the place the panel is in (a folder of this machine, or a folder of a remote) under a name; `bl` is the list — `★` the ones you kept, then the `[bookmarks]` of the config — with a search field (`/` or `Ctrl-f` types, `Esc` stops typing): Enter goes there (a remote bookmark connects), `o` goes there in the other panel, `d` deletes a kept one, `r` renames it; `bd` is a list to choose the one to delete and `br` one to rename (both have the search field). A bookmarked folder has a `★` in the type column (`vc`). They are kept in `$XDG_STATE_HOME/lvim-commander/bookmarks.toml`, shared by every lvc |
 | `g[` `g]` · `go` `gi` · `g?` | back / forward in the history · the directory under the cursor / this one → the other panel · help |
 | `vv` · `vi` | the quick view on / off · info about the file under the cursor: path, kind, type, size, mode, owner, the three times, link target |
 | `vb` | synchronized browsing (see Remote files) |
+| `al` | **retarget a symbolic link**: where the link under the cursor points is a field to change; the link is made again beside the old one and moved over it (a remote's link is removed and made again there) |
 | `vz` | zoom: the active panel has the whole screen (`vz` again, or `Tab`, to get two panels) |
 | `os` · `gi` | the other panel goes where this one is: a folder of this machine, or the same connection and path on a remote |
 | `vd` | compare the two panels' directories by name, size and time: in each panel what the other lacks or has different is marked (copy it with `oc`) |
@@ -132,7 +135,7 @@ The groups (`Esc` leaves one):
 ## Git
 
 Where a folder is in a git work tree, lvc shows it and works on it — all of it by the **git plugin** (`lvim-fuzzy-plugin-git`, on the
-`git` program, no library; lvc calls its library directly, and it serves lfz, the picker and lvim-files as a process plugin).
+`git` program; lvc knows nothing of git — the plugin writes the column, the bar and every dialog through the plugin API below, and it serves lfz, the picker and lvim-files too).
 
 - **Marks.** A column (it is first of the columns by default, before the type: `vc` moves it): two letters as in `git status -s`, the index
   (green: it goes into the next commit) and the work tree (`M` modified yellow, `D` deleted red, `A` added, `R` renamed, `?` untracked,
@@ -154,8 +157,8 @@ Where a folder is in a git work tree, lvc shows it and works on it — all of it
   machine has — the `ward` / `pinentry` of `~/.gnupg/gpg-agent.conf`, `pinentry` on the PATH, `$SSH_ASKPASS` — the same as the remote
   plugin does. Nothing is ever written on lvc's screen.
 - **How it is read.** Always in the background (a big repository does not stop the keys), again whenever a folder is read, and after
-  every operation; moving about inside one work tree keeps the marks on show while the next answer comes. `git = false` in the config turns
-  all of it off, `git_ignored = false` leaves ignored files unmarked (quicker beside a huge ignored folder).
+  every operation; moving about inside one work tree keeps the marks on show while the next answer comes. Without the plugin installed
+  ignored files unmarked (quicker beside a huge ignored folder).
 - The plugin's own settings (`timeout`, `long_timeout` for fetch / pull / push, `ignored`, `untracked`, `log`) are under
   `[plugins.lvim-fuzzy-plugin-git]` here or in `~/.config/lvim-plugins/lvim-fuzzy-plugin-git.toml`.
 
@@ -195,7 +198,7 @@ On a remote panel the keys are the usual ones — nothing to learn twice:
 | `vd` | compare the local and the remote directory (name, size, time) |
 | `vb` | synchronized browsing: when one panel goes into a directory or out of one, the other does the same when it can |
 
-Not on a remote (yet): the finder (`ff` / `fg`; lfz can find in a remote: `lvim-fuzzy-cli --remote work:/srv`), compress, the shell
+Not on a remote (yet): the finder (`ff` / `fg`), compress, the shell
 in the remote directory, . What an engine cannot do it says:
 `rclone` cannot set permissions or owners (use `sftp`), `ftp` can set permissions only, `mount` and `sftp` do it all.
 
@@ -260,11 +263,28 @@ names of each folder it shows — `{"call":…,"column":"plugin.id","dir":"/d","
 `[{"op":"cells","column":"plugin.id","dir":"/d","cells":{"a":[["12","green"],["K","comment"]]}}]` (pieces of text, each with a theme colour).
 The column is in `vc` with the built-in ones: it can be ticked off and moved with `J` / `K`.
 
-**Installing the plugins that ship inside lvc** (preview, open, remote, git) is the config's decision — nothing is written by itself:
+**The keys are one map.** The app's own commands and every plugin's buttons are put in the groups the same way, and the same rules hold for all:
+a plugin may *add* a key to a group (one of the app's, or one another plugin made; the first to name a group's letter makes it, a sub-group the
+same) — it may not take a key that is taken, by the app or by another plugin: that is an error. The groups `x` (git) and `r` (remote) are not in
+the app at all: their plugins place them (`builtin = "git-stage"` in the git plugin's `plugin.toml` is the operation the app does for a button
+the plugin put at `x a a`); without the plugin installed (`install`, above) the group is not there.
+
+**Moving a key** is the config's say, for the app and for every plugin, and what it moves is checked with the rest:
+
+```toml
+[keys]
+"zoom"      = "v y"               # the app's command `zoom` on `v y` (a place: group, [sub-group,] key); `find = "alt-f"` is a key of its own
+[plugins.lvim-fuzzy-plugin-git.keys]
+stage = "x a z"                   # a plugin's button by the action's name; the same under [keys] of ~/.config/lvim-plugins/<name>.toml
+```
+
+**A wrong config does not start lvc.** Before anything is drawn the config, the themes, the plugins (their manifests, their settings files) and the
+map of the keys are checked; every problem is printed — a key that two things want says who wants it — and lvc exits with status 2.
+
+**Installing the plugins that ship inside lvc** (preview, open, remote, git, devices) is the config's decision — nothing is written by itself:
 
 ```toml
 [plugins.lvim-fuzzy-plugin-remote]
-install = "bundled"               # lvc writes the plugin's plugin.toml, with itself answering as the plugin
 # install = "/path/to/lvim-fuzzy-plugin-remote"   # or another program answers (a build of the plugin's own)
 ```
 
@@ -281,6 +301,32 @@ A plugin can name a **runtime** in `plugin.toml` (`runtime = "command"` — the 
 `other-cd`, `select`/`mark` (`name`), `reload`, `message`/`error` (`text`), and the interactive ones —
 `input` (`prompt`, `value`, `then`), `confirm` (`text`, `then`), `menu` (`title`, `items` of `label` + `call`),
 `preview` (`text`). `lvc --plugins` shows each plugin's runtime and whether its script, module or library loads.
+
+**What a plugin can write in lvc (all runtimes).** The app knows no plugin by name: everything below is the same for each.
+
+- **The call's context** has `call`, `arg`, `data` (the note an instruction left, see below), `file`, `files`, `dir`, `other_dir`, `panel`, plus
+  `names` (the marked entries, or the one under the cursor), `dirs` (those of them that are folders) and, in a panel on a server, `remote` and
+  `ssh` (`{host, user?, port?, key?}` of an SFTP connection) with `dir` the path there.
+- **A column** (`[columns.<id>]`: `call`, `title`, `position = "first"`, `remote = true` to be asked for a server's folder too, `always = true`
+  to be asked even when its column is off). The call is made for each folder shown, again whenever it is read again, and answers:
+  `{"op":"cells","column","dir","remote"?,"cells":{"name":[["text","colour"],…]},"flags":{"name":["fact",…]}}`,
+  `{"op":"bar","bar":"id","dir","segments":[["text","colour"],…]}` (a piece of the path bar; a colour may add `bold`: `"red bold"`) and
+  `{"op":"state","dir","flags":["fact",…]}` (the folder as a whole). One call may answer all three.
+- **A button** (`[actions.<id>]`: `call`, `group`, `sub`, `button`, `title`, …) may say `when = ["repo", "item:staged", "one:file", "!busy"]`:
+  it is shown only while all hold — `x` the folder has the fact, `item:x` some target has it, `one:x` the only target has it, `!` turns round.
+- **`menu`** (`title`, `items` of `label`, `call`, `arg`, `cells`, `enter` = what Enter is called, `keys`): a list with search. An item's `keys`
+  are `{"key":"d","label":"delete","call","arg"?,"confirm"?}` — pressed on the item they call the plugin (after a yes / no with the `confirm`
+  text), and show as buttons below.
+- **`text`** (`title`, `text` or `lines` — each a string or a list of `[text, colour]` pieces —, `diff` to colour `+` `-` `@@` lines, `anchors` =
+  lines `]` / `[` move among, `current`, `keys` as above — their call gets `arg` = `{"anchor","line","data"}` —, `data`): a text on the whole screen.
+  `close` leaves it.
+- **`input`** (`prompt`, `value`, `then`, `data`) and **`confirm`** (`title`, `text`, `then`, `data`): the call `then` gets the typed text as `arg`
+  (a `confirm` gets its `data` as `arg`) and `data` as `data`.
+- **`notify`** (`level` = `debug` `info` `status` `success` `warn` `error`, `title`, `text`): a card at the bottom right — a bar and a chip in the level's colour,
+  the title, the time, the text — for a few seconds (an error longer), kept in `oo` → Notifications. A button that calls a plugin shows a `status`
+  card at once; the answer replaces it. `message` / `error` are an `info` / `error` card.
+- **`badge`** (`text`, `colour`): a mark at the right of the title bar, the plugin's own (empty `text` removes it). **`refresh`** asks the
+  columns again; **`reload`** reads the folders again.
 
 **`runtime = "process"`** (done): the plugin is one long-lived program, `exec = "./run"` (`sh -c`, started in the
 plugin's directory with `$LVIM_PLUGIN_DIR`, at the first call; its stderr is dropped). lvc writes a JSON line per
@@ -362,6 +408,7 @@ nvim    = "nvim"
 pool    = true                   # take the preview's Neovim from `lvim-fuzzy-cli pool`
 git     = true                   # the git marks and the group x (the git plugin); off: git is not asked at all
 git_ignored = true               # mark ignored files too (dimmed); off is quicker beside a big ignored folder
+clipboard_files = true           # yy / yx put the files themselves in the desktop clipboard (text/uri-list) too
 image_transfer = "file"          # pictures: the terminal reads a temp file (fast); "direct" sends the bytes
 
 [keys]                           # any command on another key (`?` shows the new ones)
@@ -373,14 +420,12 @@ up   = "ctrl-p"                  # empty-trash chmod chown compress extract undo
 "git.log" = "alt-g"              # a plugin's action: "plugin.action"; a config action: its id
                                  # (lvc --plugins lists them; plugins load first, then these move their keys)
 
-[bookmarks]                      # gb
+[bookmarks]                      # bl
 home = "~"
 code = "~/development"
 
 [plugins.lvim-fuzzy-plugin-preview]               # the plugins that ship inside lvc are installed only where you say so
-install = "bundled"
 [plugins.lvim-fuzzy-plugin-open]
-install = "bundled"
 
 [plugins.lvim-fuzzy-plugin-open.types.pictures]   # Enter on a file: the open plugin's configuration, lvc's own layer
 mime   = ["image/*"]
@@ -402,6 +447,20 @@ shared with lvim-fuzzy), checked out next to it.
 cargo build --release
 scripts/install.sh      # ~/.local/bin/lvc
 ```
+
+## The plugins and where each is used
+
+lvc carries no plugin: each is a program of its own (`scripts/install.sh` of its repository). What lvc uses them for:
+
+| Plugin | In lvc |
+|---|---|
+| `lvim-fuzzy-plugin-git` | the marks column, the branch and counts in the path bar, the `x` group |
+| `lvim-fuzzy-plugin-remote` | panels on servers / clouds / mounts, the connections (`r` group) |
+| `lvim-fuzzy-plugin-devices` | disks, phones and shares (`g` group) |
+| `lvim-fuzzy-plugin-preview` | the quick view and the viewer |
+| `lvim-fuzzy-plugin-open` | which program opens a file |
+
+Without a plugin installed, its part is simply not there. `lvc --plugins` lists what is loaded.
 
 ## License
 

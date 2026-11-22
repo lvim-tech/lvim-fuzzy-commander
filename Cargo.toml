@@ -17,17 +17,14 @@ lvim-fuzzy-core = { path = "../lvim-fuzzy-core" }
 # the lvim look: themes, canvas, icons, file and Neovim previews, the warm Neovim pool
 lvim-fuzzy-ui = { path = "../lvim-fuzzy-ui" }
 crossterm = { version = "0.29", features = ["use-dev-tty"] }
-toml = "0.9"
+toml = { version = "0.9", features = ["preserve_order"] }
 serde_json = "1"
 # the plugin host (process, native, WebAssembly and Lua runtimes), shared with lvim-fuzzy-cli and lvim-picker
 lvim-fuzzy-plugin = { path = "../lvim-fuzzy-plugin" }
-# the preview plugin ships inside this program (`lvim-fuzzy-commander --lvim-plugin preview`) and installs itself
-lvim-fuzzy-plugin-preview = { path = "../lvim-fuzzy-plugin-preview" }
-# ... and the open plugin (`lvim-fuzzy-commander --lvim-plugin open`)
-lvim-fuzzy-plugin-open = { path = "../lvim-fuzzy-plugin-open" }
-lvim-fuzzy-plugin-remote = { path = "../lvim-fuzzy-plugin-remote" }
-# ... and the git plugin (`lvim-fuzzy-commander --lvim-plugin git`): the marks of a work tree and the operations on it
-lvim-fuzzy-plugin-git = { path = "../lvim-fuzzy-plugin-git" }
+
+
+
+
 libc = "0.2"
 
 [profile.release]

@@ -48,6 +48,16 @@ pub struct ArcView {
     pub origin: Option<Place>,
 }
 
+/// Where a plugin's answer is about: the server (`None`: this machine) and the folder on it.
+pub type PlaceKey = (Option<String>, PathBuf);
+
+/// What a plugin said of a folder as a whole.
+#[derive(Clone, Debug, Default)]
+pub struct PluginState {
+    pub key: PlaceKey,
+    pub flags: Vec<String>,
+}
+
 pub struct Panel {
     pub place: Place,
     /// A remote directory is being read (the answer comes later).
@@ -83,21 +93,16 @@ pub struct Panel {
     pub error: Option<String>,
     /// Something the panel refused to do and the app should say (a remote does not let go of the panel but by disconnecting).
     pub notice: Option<String>,
-    /// The state of the git work tree the directory is in (read by the app in the background; `None`: not in one).
-    pub git: Option<std::sync::Arc<lvim_fuzzy_plugin_git::status::Status>>,
-    /// Where the directory is in that work tree (`""` = its top).
-    pub git_base: String,
-    /// The directory `git` was read for (on the remote `git_remote`, when it is a server's directory).
-    pub git_dir: Option<PathBuf>,
-    pub git_remote: Option<String>,
-    /// The state should be read again (the directory was read again, something was done).
-    pub git_want: bool,
-    /// A read is on its way.
-    pub git_busy: bool,
+    /// What plugins said of the folder as a whole: plugin name → (the place, flags, the plugin's note).
+    pub plugin_state: std::collections::HashMap<String, PluginState>,
+    /// What plugins wrote in the path bar: bar id → (the place, pieces of (text, colour)).
+    pub plugin_bars: std::collections::HashMap<String, (PlaceKey, Vec<(String, String)>)>,
+    /// What plugins know of each entry: column id → (the place, name → flags).
+    pub plugin_flags: std::collections::HashMap<String, (PlaceKey, std::collections::HashMap<String, Vec<String>>)>,
     /// What the plugins' columns answered for this panel's folder: column id → (the folder, name → pieces of (text, colour)).
-    pub plugin_cells: std::collections::HashMap<String, (PathBuf, std::collections::HashMap<String, Vec<(String, String)>>)>,
+    pub plugin_cells: std::collections::HashMap<String, (PlaceKey, std::collections::HashMap<String, Vec<(String, String)>>)>,
     /// The folder the plugins' columns were asked for, and whether they are to be asked again (the folder was read again).
-    pub cells_dir: Option<PathBuf>,
+    pub cells_dir: Option<PlaceKey>,
     pub cells_want: bool,
 }
 
@@ -126,12 +131,9 @@ impl Panel {
             last_in: Default::default(),
             error: None,
             notice: None,
-            git: None,
-            git_base: String::new(),
-            git_dir: None,
-            git_remote: None,
-            git_want: true,
-            git_busy: false,
+            plugin_state: Default::default(),
+            plugin_bars: Default::default(),
+            plugin_flags: Default::default(),
             plugin_cells: Default::default(),
             cells_dir: None,
             cells_want: true,
@@ -204,6 +206,15 @@ impl Panel {
         self.refilter();
     }
 
+    /// Where the plugins' answers for this panel are about: a folder of this machine, or of a server. Nothing else (an archive, the trash) has one.
+    pub fn place_key(&self) -> Option<PlaceKey> {
+        match (&self.place, self.archive.is_some()) {
+            (Place::Dir(d), false) => Some((None, d.clone())),
+            (Place::Remote { remote, path }, _) => Some((Some(remote.clone()), PathBuf::from(path))),
+            _ => None,
+        }
+    }
+
     pub fn is_trash(&self) -> bool {
         self.place == Place::Trash
     }
@@ -212,7 +223,6 @@ impl Panel {
     pub fn reload(&mut self) {
         let keep = self.current().map(|e| e.name.clone());
         self.error = None;
-        self.git_want = true;
         self.cells_want = true;
         match &self.place {
             Place::Dir(d) => {

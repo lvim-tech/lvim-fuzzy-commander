@@ -1,60 +1,28 @@
-//! The buttons of the bottom bar that plugins add: an action with `group`, `button` (and `sub`) in its `plugin.toml` sits in a group of keys
-//! (a built-in one, or a group of the plugin's own, whose letter is none of the built-in ones) and in a sub-group of it.
+//! The help of the key groups, made from the map of the keys (not written by hand): every group, the app's and the plugins', with where its
+//! buttons are — so a button a plugin added, or a user moved, is in the help where it is.
 
 use super::*;
 
-/// A button of a plugin: its key, its label, and the action it runs (an index into `App::actions`).
-pub(super) struct SlotButton {
-    pub key: char,
-    pub label: String,
-    pub action: usize,
-}
-
 impl App {
-    /// The buttons plugins put in group `g` (in its sub-group `sub`).
-    pub(super) fn slot_buttons(&self, g: char, sub: Option<char>) -> Vec<SlotButton> {
-        self.actions
-            .iter()
-            .enumerate()
-            .filter_map(|(i, a)| {
-                let s = a.slot.as_ref()?;
-                (s.group == g && s.sub == sub).then(|| SlotButton { key: s.key, label: a.title.clone(), action: i })
-            })
-            .collect()
-    }
-
-    /// The sub-groups plugins make in group `g`: the key and the label.
-    pub(super) fn slot_subs(&self, g: char) -> Vec<(char, String)> {
-        let mut out: Vec<(char, String)> = Vec::new();
-        for a in &self.actions {
-            let Some(s) = &a.slot else { continue };
-            if s.group != g {
-                continue;
+    /// One line per group: the group's letter and title, then its sub-groups and buttons (`key label`), as `?` shows them.
+    pub(super) fn group_help_lines(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for (g, title) in &self.keymap.groups {
+            let mut parts: Vec<String> = Vec::new();
+            let mut seen: Vec<&What> = Vec::new();
+            for b in self.keymap.items(*g, None) {
+                if seen.contains(&&b.what) {
+                    continue;
+                }
+                seen.push(&b.what);
+                parts.push(format!("{} {}", b.key, b.label));
             }
-            if let Some(sub) = s.sub
-                && !out.iter().any(|(k, _)| *k == sub)
-            {
-                out.push((sub, s.sub_title.clone().unwrap_or_else(|| sub.to_string())));
+            for (s, st) in self.keymap.subs_of(*g) {
+                let inner: Vec<String> = self.keymap.items(*g, Some(s)).map(|b| format!("{} {}", b.key, b.label)).collect();
+                parts.push(format!("{s} {st} [{}]", inner.join(" · ")));
             }
+            out.push((format!("{g} …"), format!("{title}: {}", parts.join(" · "))));
         }
         out
-    }
-
-    /// The groups plugins make: a letter that is none of the built-in groups (nor `x`), and its title.
-    pub(super) fn slot_groups(&self) -> Vec<(char, String)> {
-        let mut out: Vec<(char, String)> = Vec::new();
-        for a in &self.actions {
-            let Some(s) = &a.slot else { continue };
-            if GROUPS.iter().any(|(g, _, _)| *g == s.group) || out.iter().any(|(k, _)| *k == s.group) {
-                continue;
-            }
-            out.push((s.group, s.group_title.clone().unwrap_or_else(|| s.group.to_string())));
-        }
-        out
-    }
-
-    /// The action behind the key `c` pressed in group `g` (sub-group `sub`), when a plugin put a button there.
-    pub(super) fn slot_action(&self, g: char, sub: Option<char>, c: char) -> Option<usize> {
-        self.slot_buttons(g, sub).into_iter().find(|b| b.key == c).map(|b| b.action)
     }
 }

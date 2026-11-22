@@ -251,6 +251,20 @@ fn run(kind: JobKind, sources: Vec<PathBuf>, dest: Option<PathBuf>, mask: Option
     let mut errors = Vec::new();
     let mut undo = Vec::new();
     let mut policy: Option<Conflict> = None;
+    // a destination that is not there is made: a folder for several things (or a name that ends with `/`, or a rename mask), the parent
+    // folders of a new full path for one thing — a copy to a new place needs no `mkdir` first
+    if matches!(kind, JobKind::Copy | JobKind::Move)
+        && let Some(d) = &dest
+        && !d.exists()
+    {
+        let as_dir = mask.is_some() || sources.len() > 1 || d.to_string_lossy().ends_with('/');
+        let make = if as_dir { Some(d.as_path()) } else { d.parent() };
+        if let Some(m) = make
+            && let Err(e) = std::fs::create_dir_all(m)
+        {
+            errors.push(format!("{}: {e}", m.display()));
+        }
+    }
     for src in &sources {
         if cancel.load(Ordering::Relaxed) {
             break;
@@ -544,6 +558,30 @@ mod tests {
         let (n, _) = finish(start(JobKind::Copy, vec![d.join("src/b.txt")], Some(d.join("src")), None), Conflict::Rename);
         assert_eq!(n, 1);
         assert!(d.join("src/b (2).txt").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_destination_that_is_not_there_is_made() {
+        let d = tmp("mkdest");
+        std::fs::write(d.join("a.txt"), "a").unwrap();
+        std::fs::write(d.join("b.txt"), "b").unwrap();
+        // several files to a folder that does not exist: made, and they go into it
+        let (n, e) = finish(start(JobKind::Copy, vec![d.join("a.txt"), d.join("b.txt")], Some(d.join("new/deep")), None), Conflict::Overwrite);
+        assert_eq!((n, e.len()), (2, 0), "{e:?}");
+        assert!(d.join("new/deep/a.txt").exists() && d.join("new/deep/b.txt").exists());
+        // one file to a name ending with `/`: a folder, made
+        let (n, e) = finish(start(JobKind::Copy, vec![d.join("a.txt")], Some(PathBuf::from(format!("{}/other/", d.display()))), None), Conflict::Overwrite);
+        assert_eq!((n, e.len()), (1, 0), "{e:?}");
+        assert!(d.join("other/a.txt").exists());
+        // one file to a new full path in a folder that is not there: the parents are made, the name is the file's new name
+        let (n, e) = finish(start(JobKind::Copy, vec![d.join("a.txt")], Some(d.join("p/q/renamed.txt")), None), Conflict::Overwrite);
+        assert_eq!((n, e.len()), (1, 0), "{e:?}");
+        assert!(d.join("p/q/renamed.txt").is_file());
+        // a move too
+        let (n, e) = finish(start(JobKind::Move, vec![d.join("b.txt")], Some(d.join("moved/")), None), Conflict::Overwrite);
+        assert_eq!((n, e.len()), (1, 0), "{e:?}");
+        assert!(d.join("moved/b.txt").exists() && !d.join("b.txt").exists());
         let _ = std::fs::remove_dir_all(&d);
     }
 

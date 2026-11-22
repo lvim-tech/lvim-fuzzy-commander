@@ -26,6 +26,10 @@
 //! other panel's directory. The same reach the command as `$LVC_FILE`, `$LVC_FILES` (one per line),
 //! `$LVC_DIR`, `$LVC_OTHER_DIR`.
 //!
+//! A button may run an operation of the APP's own (`builtin = "git-stage"`): the plugin says where the button is and what it is called, the
+//! app does the work (the git and remote groups are made this way). Where the buttons are can be moved in the config: `[keys] "zoom" = "v z"`
+//! (the app's commands) and `[plugins.<name>.keys] lint = "x a l"` (a plugin's); what is taken is an error, and the app does not start.
+//!
 //! A BUTTON of its own: an action may sit in the bottom bar, in a group of keys (the key groups are `t m a y p f g o x r v`; a letter
 //! that is none of them makes a new group of the plugin's):
 //!
@@ -54,8 +58,10 @@
 //! [{"op":"cd","path":"/tmp"}, {"op":"message","text":"done"},
 //!  {"op":"input","prompt":"Name","value":"x","then":"make"},
 //!  {"op":"confirm","text":"Sure?","then":"go"},
-//!  {"op":"menu","title":"Pick","items":[{"label":"One","call":"one"}]},
-//!  {"op":"preview","text":"shown in the quick view"}]
+//!  {"op":"menu","title":"Pick","items":[{"label":"One","call":"one"},
+//!   {"label":"text a search matches","call":"two","cells":[["/dev/sdb1","blue"],["16G","cyan"]]}]},
+//!  {"op":"preview","text":"shown in the quick view"},
+//!  {"op":"text","title":"diff a b","text":"a text on the whole screen (a diff is coloured)"}]
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -85,10 +91,17 @@ pub struct Action {
     pub command: String,
     /// The plugin function to call (runtime other than `command`).
     pub call: Option<String>,
+    /// The app's own operation this button runs (`git-stage`, `remote-list` …): the plugin says where the button is and what it is called,
+    /// the app does the work.
+    pub builtin: Option<String>,
     pub mode: Mode,
     pub reload: bool,
     /// Where its button is in the bottom bar, when it has one.
     pub slot: Option<Slot>,
+    /// When the button is there (`when = ["repo", "item:unstaged"]`): conditions on what the plugin said of this folder (`state`) and of the entries
+    /// it is for (`flags` of the cells): `x` the folder has the flag, `!x` it has not, `item:x` some target has it, `one:x` the only target has it,
+    /// `!item:x` no target has it. Empty: always.
+    pub when: Vec<String>,
     /// "config", or the plugin it comes from.
     pub source: String,
     /// The plugin's directory ($LVC_PLUGIN_DIR).
@@ -114,6 +127,12 @@ pub struct ColumnDef {
     pub plugin: String,
     /// The plugin function that answers with the cells.
     pub call: String,
+    /// `position = "first"`: when the column is new, it goes first of the columns (not last).
+    pub first: bool,
+    /// `remote = true`: it is asked for a server's folder too (a plugin that can work over ssh).
+    pub remote: bool,
+    /// `always = true`: it is asked even when its column is off (it also writes the path bar and the folder's state).
+    pub always: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -273,7 +292,13 @@ pub fn parse_actions(
             continue;
         };
         let s = |k: &str| a.get(k).and_then(|v| v.as_str()).map(str::to_string);
+        let builtin = s("builtin");
+        if builtin.is_some() && (s("command").is_some() || s("call").is_some()) {
+            errs.push(format!("{at}: actions.{id}: `builtin` is the app's own operation, with no `command` or `call`"));
+            continue;
+        }
         let (command, call) = match (s("command"), s("call")) {
+            _ if builtin.is_some() => (String::new(), None),
             (Some(_), Some(_)) => {
                 errs.push(format!("{at}: actions.{id}: `command` or `call`, not both"));
                 continue;
@@ -289,7 +314,7 @@ pub fn parse_actions(
                 (String::new(), Some(c))
             }
             (None, None) => {
-                errs.push(format!("{at}: actions.{id} needs a `command` (or a `call`)"));
+                errs.push(format!("{at}: actions.{id} needs a `command` (or a `call`, or a `builtin`)"));
                 continue;
             }
         };
@@ -314,9 +339,9 @@ pub fn parse_actions(
             },
         };
         for k in a.keys() {
-            if !["title", "key", "command", "call", "mode", "reload", "group", "group_title", "sub", "sub_title", "button"].contains(&k.as_str()) {
+            if !["title", "key", "command", "call", "builtin", "mode", "reload", "group", "group_title", "sub", "sub_title", "button", "when"].contains(&k.as_str()) {
                 errs.push(format!(
-                    "{at}: actions.{id}: unknown key `{k}` (title, key, command, call, mode, reload, group, group_title, sub, sub_title, button)"
+                    "{at}: actions.{id}: unknown key `{k}` (title, key, command, call, builtin, mode, reload, group, group_title, sub, sub_title, button, when)"
                 ));
             }
         }
@@ -335,9 +360,15 @@ pub fn parse_actions(
             key,
             command,
             call,
+            builtin,
             mode,
             reload: a.get("reload").and_then(|v| v.as_bool()).unwrap_or(false),
             slot,
+            when: match a.get("when") {
+                Some(toml::Value::String(w)) => vec![w.clone()],
+                Some(toml::Value::Array(l)) => l.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+                _ => Vec::new(),
+            },
             source: source.to_string(),
             dir: dir.map(Path::to_path_buf),
         });
@@ -401,8 +432,10 @@ pub fn load_plugins(roots: &[PathBuf]) -> (Vec<Plugin>, Vec<Action>, Vec<Preview
                 "preview" | "open" => {}
                 // the columns a plugin brings: read by `load_columns`
                 "columns" => {}
+                // `places = true`: the plugin serves places (connections shown as folders); read by the places client of the host
+                "places" => {}
                 other => errs.push(format!(
-                    "{at}: unknown key `{other}` (name, description, runtime, hosts, api, version, author, license, repository, exec, events, library, module, allow_write, script, build, requires, config, actions, previewers, columns, preview, open)"
+                    "{at}: unknown key `{other}` (name, description, runtime, hosts, api, version, author, license, repository, exec, events, library, module, allow_write, script, build, requires, config, actions, previewers, columns, places, preview, open)"
                 )),
             }
         }
@@ -425,7 +458,43 @@ pub fn load_columns(roots: &[PathBuf]) -> Vec<ColumnDef> {
                 title: c.get("title").and_then(|v| v.as_str()).unwrap_or(id).to_string(),
                 plugin: m.def.name.clone(),
                 call: call.to_string(),
+                first: c.get("position").and_then(|v| v.as_str()) == Some("first"),
+                remote: c.get("remote").and_then(|v| v.as_bool()).unwrap_or(false),
+                always: c.get("always").and_then(|v| v.as_bool()).unwrap_or(false),
             });
+        }
+    }
+    out
+}
+
+/// The places the config moved plugins' buttons to: `[plugins.<name>.keys] action = "x a a"` of the app's config, and `keys` of the plugin's own
+/// shared settings file (`~/.config/lvim-plugins/<name>.toml`). `(plugin.action, place)`; a value that is no place is a problem.
+pub fn plugin_moves(own: &toml::Table, defs: &[Plugin], plugins_dir: &Path, errs: &mut Vec<String>) -> Vec<(String, crate::app::Pos)> {
+    let mut out = Vec::new();
+    let mut take = |name: &str, table: &toml::Value, at: &str, errs: &mut Vec<String>| {
+        let Some(t) = table.as_table() else {
+            errs.push(format!("{at}: `keys` must be a table: action = \"x a a\""));
+            return;
+        };
+        for (action, v) in t {
+            match v.as_str().and_then(crate::app::parse_pos) {
+                Some(p) => out.push((format!("{name}.{action}"), p)),
+                None => errs.push(format!("{at}: keys.{action}: a place in the groups like \"x a a\" (group, sub-group, key) or \"v z\" (group, key)")),
+            }
+        }
+    };
+    for d in defs {
+        // the plugin's own shared settings file
+        let file = plugins_dir.join(format!("{}.toml", d.name));
+        if let Ok(text) = std::fs::read_to_string(&file)
+            && let Ok(t) = text.parse::<toml::Table>()
+            && let Some(k) = t.get("keys")
+        {
+            take(&d.name, k, &file.display().to_string(), errs);
+        }
+        // lvc's own layer over it
+        if let Some(k) = own.get(&d.name).and_then(|v| v.as_table()).and_then(|t| t.get("keys")) {
+            take(&d.name, k, &format!("[plugins.{}] of the config", d.name), errs);
         }
     }
     out
@@ -552,22 +621,120 @@ pub enum Instr {
     Message(String),
     Error(String),
     /// A text field; the answer goes to the plugin function `then`.
-    Input { prompt: String, value: String, then: String },
+    /// `data`: a note the plugin hands itself — it comes back as `ctx.data` in the call `then`.
+    Input { prompt: String, value: String, then: String, data: Option<String> },
     /// A yes / no; on yes the plugin function `then` is called.
-    Confirm { text: String, then: String },
+    Confirm { title: Option<String>, text: String, then: String, data: Option<String> },
     /// A list; the picked item's `call` is called.
     Menu { title: String, items: Vec<MenuEntry> },
     /// Text (ANSI allowed) for the quick view.
     Preview(String),
+    /// A text on the whole screen with its title (the viewer's keys; a diff is coloured): a plugin's long answer.
+    Text(TextSpec),
+    /// A form (a dialog of fields): the plugin asks for several things at once; OK calls `then` with the values.
+    Form(FormSpec),
+    /// Go to a place a plugin serves (a panel on a connection of a places plugin) in the active panel.
+    Go { remote: String, path: String },
+    /// The panels on this place go back to where they were on this machine (the connection was closed or deleted).
+    Leave { remote: String },
+    /// The plugin's settings changed (it wrote them itself): read them again.
+    Reconfigure,
+    /// Leave the whole-screen text.
+    Close,
+    /// Ask for the folders' cells / bar / state again (something changed that the tool cannot see).
+    Refresh,
+    /// A notification: shown for a moment (an error stays longer) and kept in the list of notifications (`oo` → Notifications). `level`: `info`, `warn`
+    /// or `error`; `title` says who or what it is about (the plugin's name when empty).
+    Notify { level: String, title: String, text: String },
+    /// A badge at the right of the title bar, the plugin's own (`text` empty: gone).
+    Badge { text: String, colour: String },
     /// The cells of a column a plugin brings, for the names of a folder: `[(text, colour)]` pieces each.
-    Cells { column: String, dir: PathBuf, cells: Vec<(String, Vec<(String, String)>)> },
+    /// `flags`: per entry, facts the plugin has about it (`unstaged`, `tracked` …) — for the `when` of its buttons.
+    Cells { column: String, dir: PathBuf, remote: Option<String>, cells: Vec<(String, Vec<(String, String)>)>, flags: Vec<(String, Vec<String>)> },
+    /// A piece of the path bar: (text, colour) segments for the folder `dir`, written by the bar `bar` of a plugin.
+    Bar { bar: String, dir: PathBuf, remote: Option<String>, segments: Vec<(String, String)> },
+    /// What the plugin says of the folder as a whole (`repo`, `staged`, `busy` …): flags for the `when` of its buttons.
+    State { dir: PathBuf, remote: Option<String>, flags: Vec<String> },
+}
+
+/// One line of a form. `kind` is `text` (typed, with `suggest` as a drop-down on Enter) or `choice` (one of `options`, ← → or Enter). A line with
+/// `when` (`{"type": ["0", "3"]}`) is there only while the field `type` has one of those values; `locked` cannot be changed.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct FormField {
+    pub id: String,
+    pub label: String,
+    pub choice: bool,
+    pub hint: String,
+    pub suggest: Vec<(String, String)>,
+    pub suggest_empty: String,
+    pub options: Vec<(String, String)>,
+    pub when: Vec<(String, Vec<String>)>,
+    pub locked: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct FormSpec {
+    pub title: String,
+    pub fields: Vec<FormField>,
+    pub values: std::collections::BTreeMap<String, String>,
+    pub then: String,
+    pub data: Option<String>,
+    pub note: String,
+}
+
+/// A key of a list's item or of a whole-screen text: pressed, it calls the plugin function `call` (with `arg`, or the item's own `arg`); with
+/// `confirm` a yes / no with that text comes first. `label` is what the button at the bottom says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ItemKey {
+    pub key: char,
+    pub label: String,
+    pub call: String,
+    pub arg: Option<String>,
+    pub confirm: Option<String>,
+}
+
+/// A text on the whole screen. `lines` are plain, or — `spans` — each in coloured pieces (the line is their joined text). `diff`: lines are coloured
+/// by what a diff / commit text starts them with. `anchors` are lines `]` and `[` move among (`current` is the one lit); `keys` are the buttons
+/// of the screen: their call gets `arg` = `{"anchor": n, "line": l}` and the `data` back.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct TextSpec {
+    pub title: String,
+    pub lines: Vec<String>,
+    pub spans: Vec<Vec<(String, String)>>,
+    pub diff: bool,
+    pub anchors: Vec<usize>,
+    pub current: usize,
+    pub keys: Vec<ItemKey>,
+    pub data: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MenuEntry {
+    pub keys: Vec<ItemKey>,
+    /// What Enter does, for the button at the bottom (`go` when not said).
+    pub enter: Option<String>,
     pub label: String,
     pub call: String,
     pub arg: Option<String>,
+    /// The row as columns: (text, theme colour) each; the tool aligns them one under another. Empty: the row is just its `label`.
+    pub cells: Vec<(String, String)>,
+}
+
+/// The `keys` of an item or a text: `[{"key": "d", "label": "delete", "call": "delete", "arg"?, "confirm"?}]` (a key that is not one character is left out).
+fn item_keys(v: Option<&serde_json::Value>) -> Vec<ItemKey> {
+    v.and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|k| {
+                    let s = |n: &str| k.get(n).and_then(|v| v.as_str()).map(str::to_string);
+                    let key = s("key")?;
+                    let mut cs = key.chars();
+                    let (c, rest) = (cs.next()?, cs.next());
+                    rest.is_none().then_some(ItemKey { key: c, label: s("label").unwrap_or_default(), call: s("call")?, arg: s("arg"), confirm: s("confirm") })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub fn parse_instr(line: &str) -> Option<Instr> {
@@ -614,8 +781,50 @@ pub fn parse_response(text: &str) -> Result<Vec<Instr>, String> {
                 prompt: get("prompt").unwrap_or("").to_string(),
                 value: get("value").unwrap_or("").to_string(),
                 then: need("then")?,
+                data: get("data").map(str::to_string),
             },
-            "confirm" => Instr::Confirm { text: need("text")?, then: need("then")? },
+            "confirm" => Instr::Confirm { title: get("title").map(str::to_string), text: need("text")?, then: need("then")?, data: get("data").map(str::to_string) },
+            "notify" => Instr::Notify { level: get("level").unwrap_or("info").to_string(), title: get("title").unwrap_or("").to_string(), text: need("text")? },
+            "go" => Instr::Go { remote: need("remote")?, path: get("path").unwrap_or("").to_string() },
+            "leave" => Instr::Leave { remote: need("remote")? },
+            "reconfigure" => Instr::Reconfigure,
+            "form" => {
+                let pairs = |v: Option<&serde_json::Value>| -> Vec<(String, String)> {
+                    v.and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| match x {
+                                    serde_json::Value::String(s) => Some((s.clone(), s.clone())),
+                                    o => Some((o.get("shown")?.as_str()?.to_string(), o.get("value")?.as_str()?.to_string())),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                let mut spec = FormSpec { title: get("title").unwrap_or("").to_string(), then: need("then")?, data: get("data").map(str::to_string), note: get("note").unwrap_or("").to_string(), ..Default::default() };
+                for f in it.get("fields").and_then(|v| v.as_array()).ok_or_else(|| format!("instruction {i}: missing `fields`"))? {
+                    let s = |k: &str| f.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let options = f.get("options").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|o| Some((o.get("label")?.as_str()?.to_string(), o.get("value")?.as_str()?.to_string()))).collect()).unwrap_or_default();
+                    spec.fields.push(FormField {
+                        id: s("id"),
+                        label: s("label"),
+                        choice: s("kind") == "choice",
+                        hint: s("hint"),
+                        suggest: pairs(f.get("suggest")),
+                        suggest_empty: s("suggest_empty"),
+                        options,
+                        when: f.get("when").and_then(|w| w.as_object()).map(|o| o.iter().map(|(k, v)| (k.clone(), v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default())).collect()).unwrap_or_default(),
+                        locked: f.get("locked").and_then(|v| v.as_bool()).unwrap_or(false),
+                    });
+                }
+                if let Some(o) = it.get("values").and_then(|v| v.as_object()) {
+                    spec.values = o.iter().map(|(k, v)| (k.clone(), v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))).collect();
+                }
+                Instr::Form(spec)
+            }
+            "close" => Instr::Close,
+            "refresh" => Instr::Refresh,
+            "badge" => Instr::Badge { text: get("text").unwrap_or("").to_string(), colour: get("colour").unwrap_or("").to_string() },
             "menu" => {
                 let items = it
                     .get("items")
@@ -630,14 +839,67 @@ pub fn parse_response(text: &str) -> Result<Vec<Instr>, String> {
                         return Err(format!("instruction {i}: items[{j}] needs `label` and `call`"));
                     };
                     entries.push(MenuEntry {
+                        keys: item_keys(m.get("keys")),
+                        enter: m.get("enter").and_then(|v| v.as_str()).map(str::to_string),
                         label: label.to_string(),
                         call: call.to_string(),
                         arg: m.get("arg").and_then(|v| v.as_str()).map(str::to_string),
+                        cells: m
+                            .get("cells")
+                            .and_then(|c| c.as_array())
+                            .map(|a| a.iter().filter_map(|p| Some((p.get(0)?.as_str()?.to_string(), p.get(1).and_then(|c| c.as_str()).unwrap_or("").to_string()))).collect())
+                            .unwrap_or_default(),
                     });
                 }
                 Instr::Menu { title: get("title").unwrap_or("").to_string(), items: entries }
             }
             "preview" => Instr::Preview(need("text")?),
+            "bar" => Instr::Bar {
+                bar: need("bar")?,
+                dir: PathBuf::from(need("dir")?),
+                remote: it.get("remote").and_then(|r| r.as_str()).map(str::to_string),
+                segments: it
+                    .get("segments")
+                    .and_then(|c| c.as_array())
+                    .map(|a| a.iter().filter_map(|p| Some((p.get(0)?.as_str()?.to_string(), p.get(1).and_then(|c| c.as_str()).unwrap_or("").to_string()))).collect())
+                    .unwrap_or_default(),
+            },
+            "state" => Instr::State {
+                dir: PathBuf::from(need("dir")?),
+                remote: it.get("remote").and_then(|r| r.as_str()).map(str::to_string),
+                flags: it.get("flags").and_then(|c| c.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default(),
+            },
+            "text" => {
+                let mut t = TextSpec { title: get("title").unwrap_or("").to_string(), diff: it.get("diff").and_then(|v| v.as_bool()).unwrap_or(false), ..Default::default() };
+                match it.get("lines").and_then(|v| v.as_array()) {
+                    // each line a string, or a list of [text, colour] pieces
+                    Some(ls) => {
+                        for l in ls {
+                            match l {
+                                serde_json::Value::String(s) => {
+                                    t.lines.push(s.clone());
+                                    t.spans.push(Vec::new());
+                                }
+                                serde_json::Value::Array(a) => {
+                                    let segs: Vec<(String, String)> = a.iter().filter_map(|p| Some((p.get(0)?.as_str()?.to_string(), p.get(1).and_then(|c| c.as_str()).unwrap_or("").to_string()))).collect();
+                                    t.lines.push(segs.iter().map(|(s, _)| s.as_str()).collect());
+                                    t.spans.push(segs);
+                                }
+                                _ => return Err(format!("instruction {i}: a line of `lines` is a string or a list of pieces")),
+                            }
+                        }
+                        if t.spans.iter().all(Vec::is_empty) {
+                            t.spans.clear();
+                        }
+                    }
+                    None => t.lines = need("text")?.lines().map(str::to_string).collect(),
+                }
+                t.anchors = it.get("anchors").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|n| n.as_u64().map(|n| n as usize)).collect()).unwrap_or_default();
+                t.current = it.get("current").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                t.keys = item_keys(it.get("keys"));
+                t.data = get("data").map(str::to_string);
+                Instr::Text(t)
+            }
             "cells" => {
                 let cells = it
                     .get("cells")
@@ -654,7 +916,12 @@ pub fn parse_response(text: &str) -> Result<Vec<Instr>, String> {
                             .collect()
                     })
                     .unwrap_or_default();
-                Instr::Cells { column: need("column")?, dir: PathBuf::from(need("dir")?), cells }
+                let flags = it
+                    .get("flags")
+                    .and_then(|c| c.as_object())
+                    .map(|o| o.iter().map(|(n, f)| (n.clone(), f.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default())).collect())
+                    .unwrap_or_default();
+                Instr::Cells { column: need("column")?, dir: PathBuf::from(need("dir")?), remote: it.get("remote").and_then(|r| r.as_str()).map(str::to_string), cells, flags }
             }
             other => return Err(format!("instruction {i}: unknown op `{other}`")),
         });
@@ -664,6 +931,26 @@ pub fn parse_response(text: &str) -> Result<Vec<Instr>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_places_a_plugins_buttons_were_moved_to_come_from_the_config_and_the_plugins_own_file() {
+        let dir = std::env::temp_dir().join(format!("lvc-moves-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("p.toml"), "[keys]\nlint = \"x a l\"\nbad = \"nope\"\n").unwrap();
+        std::fs::create_dir_all(dir.join("p")).unwrap();
+        std::fs::write(dir.join("p/plugin.toml"), "description = \"d\"\nhosts = [\"lvim-fuzzy-commander\"]\n").unwrap();
+        let (defs, _, _, _) = load_plugins(&[dir.clone()]);
+        assert_eq!(defs.len(), 1);
+        let own: toml::Table = toml::from_str("[p.keys]\nfmt = \"v f\"\n").unwrap();
+        let mut errs = Vec::new();
+        let m = plugin_moves(&own, &defs, &dir, &mut errs);
+        assert!(m.iter().any(|(n, p)| n == "p.lint" && p.sub == Some('a') && p.key == 'l'));
+        assert!(m.iter().any(|(n, p)| n == "p.fmt" && p.group == 'v' && p.key == 'f'));
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("keys.bad"), "{errs:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn an_action_may_have_a_button_and_a_plugin_may_have_a_column() {
         let dir = std::env::temp_dir().join(format!("lvc-btn-{}", std::process::id()));
@@ -683,10 +970,13 @@ mod tests {
         assert!(errs.iter().any(|e| e.contains("a button needs `group` and `button`")));
         assert!(actions.iter().find(|a| a.id == "bad").unwrap().slot.is_none());
         let cols = load_columns(&[dir.clone()]);
-        assert_eq!(cols, vec![ColumnDef { id: "p.size2".into(), title: "Size 2".into(), plugin: "p".into(), call: "cells".into() }]);
+        assert_eq!(cols, vec![ColumnDef { id: "p.size2".into(), title: "Size 2".into(), plugin: "p".into(), call: "cells".into(), first: false, remote: false, always: false }]);
         // the answer of a column function
         let r = parse_response(r#"[{"op":"cells","column":"p.size2","dir":"/d","cells":{"a.txt":[["12","green"],["K","comment"]]}}]"#).unwrap();
-        assert!(matches!(&r[0], Instr::Cells { column, dir, cells } if column == "p.size2" && dir == std::path::Path::new("/d") && cells[0].0 == "a.txt" && cells[0].1.len() == 2));
+        // a text on the whole screen
+        let t = parse_response(r#"[{"op":"text","title":"diff a b","text":"+x\n-y"}]"#).unwrap();
+        assert!(matches!(&t[0], Instr::Text(t) if t.title == "diff a b" && t.lines.iter().any(|l| l.contains("+x"))));
+        assert!(matches!(&r[0], Instr::Cells { column, dir, cells, .. } if column == "p.size2" && dir == std::path::Path::new("/d") && cells[0].0 == "a.txt" && cells[0].1.len() == 2));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -829,12 +1119,12 @@ mod tests {
         .unwrap();
         assert_eq!(r.len(), 7);
         assert_eq!(r[0], Instr::Cd(PathBuf::from("/tmp")));
-        assert_eq!(r[3], Instr::Input { prompt: "N".into(), value: String::new(), then: "mk".into() });
+        assert_eq!(r[3], Instr::Input { prompt: "N".into(), value: String::new(), then: "mk".into(), data: None });
         assert_eq!(
             r[5],
             Instr::Menu {
                 title: "T".into(),
-                items: vec![MenuEntry { label: "A".into(), call: "a".into(), arg: Some("1".into()) }]
+                items: vec![MenuEntry { keys: Vec::new(), enter: None, label: "A".into(), call: "a".into(), arg: Some("1".into()), cells: Vec::new() }]
             }
         );
         assert_eq!(parse_response("null").unwrap(), vec![]);
@@ -857,6 +1147,19 @@ mod tests {
     }
 
     #[test]
+    fn bar_state_and_flags_are_instructions_and_a_button_has_a_when() {
+        let r = parse_response(r#"[
+            {"op":"cells","column":"p.m","dir":"/d","remote":"srv","cells":{"a":[["M","yellow"]]},"flags":{"a":["unstaged","file"]}},
+            {"op":"bar","bar":"git","dir":"/d","segments":[[" main","magenta"],[" ~2","yellow"]]},
+            {"op":"state","dir":"/d","flags":["repo","dirty"]}
+        ]"#)
+        .unwrap();
+        assert!(matches!(&r[0], Instr::Cells { remote: Some(s), flags, .. } if s == "srv" && flags[0].1 == ["unstaged", "file"]));
+        assert!(matches!(&r[1], Instr::Bar { bar, segments, remote: None, .. } if bar == "git" && segments.len() == 2 && segments[1].1 == "yellow"));
+        assert!(matches!(&r[2], Instr::State { flags, .. } if flags == &["repo", "dirty"]));
+    }
+
+    #[test]
     fn config_moves_plugin_keys() {
         let mk = |source: &str, id: &str, key: &str| Action {
             id: id.into(),
@@ -864,9 +1167,11 @@ mod tests {
             key: KeySpec::parse(key),
             command: "true".into(),
             call: None,
+            builtin: None,
             mode: Mode::Silent,
             reload: false,
             slot: None,
+            when: Vec::new(),
             source: source.into(),
             dir: None,
         };

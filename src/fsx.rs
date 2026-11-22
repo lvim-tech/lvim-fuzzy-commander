@@ -390,3 +390,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 }
+
+/// A string for a shell: in single quotes.
+pub fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
