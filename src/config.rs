@@ -65,8 +65,6 @@ pub struct Config {
     pub image_transfer_file: bool,
     /// `[actions.*]` (see plugins.rs).
     pub actions: Vec<crate::plugins::Action>,
-    /// `leader`: the key that starts a command (the next key says which); `ctrl-c` by default.
-    pub leader: crate::plugins::KeySpec,
     /// `[keys]`: the F-key actions (help view copy rename move edit new trash delete menu quit), every
     /// other command (see `COMMANDS`) and the actions of the config and of the plugins (`id`, or
     /// `plugin.id`) on other keys, e.g. `find = "alt-f"`, `up = "ctrl-p"`, `"git.log" = "alt-g"`.
@@ -103,7 +101,6 @@ impl Default for Config {
             zellij_images: true,
             image_transfer_file: true,
             keys: Vec::new(),
-            leader: crate::plugins::KeySpec::parse("ctrl-c").expect("default leader"),
         }
     }
 }
@@ -248,18 +245,18 @@ pub fn load_from(p: &std::path::Path) -> (Config, Vec<String>) {
                             Some(b) => c.zellij_images = b,
                             None => bad(&mut errs, "true or false"),
                         },
-                        "leader" => match val.as_str().and_then(crate::plugins::KeySpec::parse) {
-                            Some(k) if valid_leader(&k) => c.leader = k,
-                            _ => bad(&mut errs, "a key with Ctrl or Alt, like \"ctrl-c\", \"ctrl-a\", \"alt-x\" (not Ctrl-j / Ctrl-k)"),
-                        },
+                        "leader" => errs.push(format!(
+                            "{}: `leader` is gone: commands are key groups now (t tabs, m marks, a actions, y copy, f find, g go, v view); F1 or g? lists them",
+                            p.display()
+                        )),
                         "keys" => match val.as_table() {
                             Some(m) => {
                                 for (name, key) in m {
                                     // (a name that is no command is a plugin / config action: checked once the plugins are loaded)
-                                    match key.as_str().and_then(crate::plugins::KeySpec::parse) {
+                                    match key.as_str().and_then(crate::plugins::KeySpec::parse).filter(|k| !k.chord) {
                                         Some(ks) => c.keys.push((name.clone(), ks)),
                                         None => errs.push(format!(
-                                            "{}: keys.{name}: a key like \"f5\", \"shift-f8\", \"leader x\", \"alt-x\"",
+                                            "{}: keys.{name}: a key like \"f5\", \"shift-f8\", \"alt-x\" (the leader is gone: commands sit in key groups)",
                                             p.display()
                                         )),
                                     }
@@ -280,7 +277,7 @@ pub fn load_from(p: &std::path::Path) -> (Config, Vec<String>) {
                             _ => bad(&mut errs, "a table of tables: [plugins.<plugin name>]"),
                         },
                         other => errs.push(format!(
-                            "{}: unknown key `{other}` (theme, leader, keys, delete, hidden, editor, preview, nvim, pool, icons, zellij_images, bookmarks, actions, previewers, plugins)",
+                            "{}: unknown key `{other}` (theme, keys, delete, hidden, editor, preview, nvim, pool, icons, zellij_images, bookmarks, actions, previewers, plugins)",
                             p.display()
                         )),
                     }
@@ -352,6 +349,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("long", "leader l"),
     ("columns", "leader v"),
     ("new-tab", "leader n"),
+    ("tab-next", "leader )"),
+    ("tab-prev", "leader ("),
     ("rename-tab", "leader ,"),
     ("tab-left", "leader <"),
     ("tab-right", "leader >"),
@@ -371,6 +370,31 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("reload", "leader r"),
     ("keys-help", "leader ?"),
     ("hints", "leader H"),
+    ("info", "leader ;"),
+    ("local", "leader G"),
+    ("redo", "leader U"),
+    ("zoom", "leader Z"),
+    ("viewer", "leader V"),
+    ("refresh", "leader R"),
+    ("sync", "leader /"),
+    ("remote-list", "leader '"),
+    ("remote-add", "leader }"),
+    ("remote-edit", "leader \""),
+    ("remote-delete", "leader :"),
+    ("subshell", "leader {"),
+    ("tasks", "leader !"),
+    ("compare", "leader ="),
+    ("yank", "leader @"),
+    ("cut", "leader #"),
+    ("paste", "leader $"),
+    ("paste-other", "leader %"),
+    ("paste-link", "leader ^"),
+    ("paste-hard", "leader &"),
+    ("paste-rename", "leader _"),
+    ("paste-copy", "leader ~"),
+    ("paste-clipboard", "leader `"),
+    ("buffer-view", "leader |"),
+    ("buffer-drop", "leader \\"),
     ("exit", "leader q"),
     ("up", "k"),
     ("down", "j"),
@@ -386,15 +410,6 @@ pub const COMMANDS: &[(&str, &str)] = &[
 /// Is `name` an F-key action or a command of `COMMANDS`?
 pub fn is_command(name: &str) -> bool {
     FKEY_ACTIONS.iter().any(|(a, _)| *a == name) || COMMANDS.iter().any(|(a, _)| *a == name)
-}
-
-/// A leader is one key with Ctrl or Alt (not Ctrl-j / Ctrl-k, which lvc handles before any command).
-pub fn valid_leader(k: &crate::plugins::KeySpec) -> bool {
-    use crossterm::event::{KeyCode, KeyModifiers};
-    !k.chord
-        && matches!(k.code, KeyCode::Char(_))
-        && (k.mods.contains(KeyModifiers::CONTROL) || k.mods.contains(KeyModifiers::ALT))
-        && !(k.mods.contains(KeyModifiers::CONTROL) && matches!(k.code, KeyCode::Char('j' | 'k')))
 }
 
 /// The actions of the F-keys and their default keys (`[keys]` moves them; the bar shows where they are).
@@ -428,8 +443,11 @@ pub struct State {
 /// One panel of a saved tab: its directory and the entry the cursor was on.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct PanelSave {
+    /// the directory; a panel in the trash keeps the one it came from (what `back` returns to)
     pub dir: PathBuf,
     pub cursor: String,
+    /// the panel was showing the trash
+    pub trash: bool,
 }
 
 /// One tab as it was left: its own name (None: the directory's), both panels, the active one, the quick view.
@@ -502,6 +520,67 @@ fn state_path() -> PathBuf {
         .join("lvim-commander/state.toml")
 }
 
+/// The file buffer (`yy` / `yx`, then `pp` …): what was copied or cut, shared by every lvc.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Buffer {
+    pub cut: bool,
+    pub paths: Vec<PathBuf>,
+    /// The remote the paths are on (they are paths in it), when they are not on this machine.
+    pub remote: Option<String>,
+    /// For a remote buffer: which of the paths are directories (parallel to `paths`).
+    pub dirs: Vec<bool>,
+}
+
+fn buffer_path() -> PathBuf {
+    state_path().with_file_name("buffer.toml")
+}
+
+pub fn load_buffer() -> Buffer {
+    let t = toml::from_str::<toml::Table>(&std::fs::read_to_string(buffer_path()).unwrap_or_default()).unwrap_or_default();
+    Buffer {
+        cut: t.get("cut").and_then(toml::Value::as_bool).unwrap_or(false),
+        paths: t
+            .get("paths")
+            .and_then(toml::Value::as_array)
+            .map(|a| a.iter().filter_map(toml::Value::as_str).map(PathBuf::from).collect())
+            .unwrap_or_default(),
+        remote: t.get("remote").and_then(toml::Value::as_str).map(str::to_string).filter(|r| !r.is_empty()),
+        dirs: t.get("dirs").and_then(toml::Value::as_array).map(|a| a.iter().filter_map(toml::Value::as_bool).collect()).unwrap_or_default(),
+    }
+}
+
+pub fn save_buffer(b: &Buffer) {
+    let mut t = toml::Table::new();
+    t.insert("cut".into(), b.cut.into());
+    if let Some(r) = &b.remote {
+        t.insert("remote".into(), r.clone().into());
+        t.insert("dirs".into(), toml::Value::Array(b.dirs.iter().map(|d| toml::Value::Boolean(*d)).collect()));
+    }
+    t.insert("paths".into(), toml::Value::Array(b.paths.iter().map(|p| toml::Value::String(p.to_string_lossy().into_owned())).collect()));
+    let p = buffer_path();
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let tmp = p.with_extension(format!("tmp{}", std::process::id()));
+    if std::fs::write(&tmp, toml::to_string(&t).unwrap_or_default()).is_ok() {
+        let _ = std::fs::rename(&tmp, &p);
+    }
+}
+
+/// The commands typed on the command line (`:` / `ax`), oldest first; kept between runs.
+pub fn load_shell_history() -> Vec<String> {
+    std::fs::read_to_string(state_path().with_file_name("shell_history")).unwrap_or_default().lines().map(str::to_string).collect()
+}
+
+pub fn save_shell_history(h: &[String]) {
+    let p = state_path().with_file_name("shell_history");
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let from = h.len().saturating_sub(500);
+    let _ = std::fs::write(&p, h[from..].join("\n") + "\n");
+}
+
 pub fn load_state() -> State {
     state_from_text(&std::fs::read_to_string(state_path()).unwrap_or_default())
 }
@@ -526,8 +605,8 @@ fn state_from_text(text: &str) -> State {
                 .map(|x| TabSave {
                     name: Some(s(x, "name")).filter(|n| !n.is_empty()),
                     panels: [
-                        PanelSave { dir: PathBuf::from(s(x, "left")), cursor: s(x, "left_cursor") },
-                        PanelSave { dir: PathBuf::from(s(x, "right")), cursor: s(x, "right_cursor") },
+                        PanelSave { dir: PathBuf::from(s(x, "left")), cursor: s(x, "left_cursor"), trash: x.get("left_trash").and_then(toml::Value::as_bool).unwrap_or(false) },
+                        PanelSave { dir: PathBuf::from(s(x, "right")), cursor: s(x, "right_cursor"), trash: x.get("right_trash").and_then(toml::Value::as_bool).unwrap_or(false) },
                     ],
                     active: x.get("active").and_then(toml::Value::as_integer).unwrap_or(0).clamp(0, 1) as usize,
                     quick: x.get("quick").and_then(toml::Value::as_bool).unwrap_or(false),
@@ -565,6 +644,8 @@ fn state_to_text(st: &State) -> String {
             e.insert("left_cursor".into(), x.panels[0].cursor.clone().into());
             e.insert("right".into(), x.panels[1].dir.to_string_lossy().into_owned().into());
             e.insert("right_cursor".into(), x.panels[1].cursor.clone().into());
+            e.insert("left_trash".into(), x.panels[0].trash.into());
+            e.insert("right_trash".into(), x.panels[1].trash.into());
             toml::Value::Table(e)
         })
         .collect();
@@ -593,8 +674,8 @@ mod state_tests {
         let tab = |name: Option<&str>, l: &str, r: &str, active, quick| TabSave {
             name: name.map(str::to_string),
             panels: [
-                PanelSave { dir: PathBuf::from(l), cursor: "a \"quoted\" name".into() },
-                PanelSave { dir: PathBuf::from(r), cursor: String::new() },
+                PanelSave { dir: PathBuf::from(l), cursor: "a \"quoted\" name".into(), trash: false },
+                PanelSave { dir: PathBuf::from(r), cursor: String::new(), trash: quick },
             ],
             active,
             quick,
@@ -634,12 +715,5 @@ mod key_tests {
             assert!(!FKEY_ACTIONS.iter().any(|(a, _)| a == n), "{n} is an F-key action");
         }
         assert!(is_command("find") && is_command("copy") && !is_command("git.log"));
-    }
-
-    #[test]
-    fn leaders() {
-        let ok = |s: &str| valid_leader(&KeySpec::parse(s).unwrap());
-        assert!(ok("ctrl-c") && ok("ctrl-a") && ok("alt-x"));
-        assert!(!ok("ctrl-j") && !ok("ctrl-k") && !ok("f5") && !ok("x") && !ok("leader x"));
     }
 }

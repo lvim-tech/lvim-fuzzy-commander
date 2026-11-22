@@ -25,6 +25,7 @@ lvim-fuzzy-plugin = { path = "../lvim-fuzzy-plugin" }
 lvim-fuzzy-plugin-preview = { path = "../lvim-fuzzy-plugin-preview" }
 # ... and the open plugin (`lvim-fuzzy-commander --lvim-plugin open`)
 lvim-fuzzy-plugin-open = { path = "../lvim-fuzzy-plugin-open" }
+lvim-fuzzy-plugin-remote = { path = "../lvim-fuzzy-plugin-remote" }
 libc = "0.2"
 
 [profile.release]

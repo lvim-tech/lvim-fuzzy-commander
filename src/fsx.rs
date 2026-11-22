@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 #[allow(unused_imports)]
-pub use lvim_fuzzy_ui::fsinfo::{Entry, Kind, Sort, date_string, entry, human_size, list_dir, local_time, natural_cmp};
+pub use lvim_fuzzy_ui::fsinfo::{Entry, Kind, Sort, date_string, entry, human_size, list_dir, local_time, natural_cmp, sort_entries};
 
 /// `drwxr-xr-x` from a mode.
 pub fn mode_string(e: &Entry) -> String {
@@ -194,6 +194,31 @@ pub fn real_users() -> Vec<String> {
         let r = v.remove(i);
         v.push(r);
     }
+    v
+}
+
+/// The people of a group: those it lists as members in /etc/group and those whose primary group it is.
+pub fn group_members(group: &str) -> Vec<String> {
+    let groups = std::fs::read_to_string("/etc/group").unwrap_or_default();
+    let mut gid = None;
+    let mut v: Vec<String> = Vec::new();
+    for l in groups.lines() {
+        let f: Vec<&str> = l.split(':').collect();
+        if f.first() == Some(&group) {
+            gid = f.get(2).and_then(|g| g.parse::<u32>().ok());
+            v.extend(f.get(3).unwrap_or(&"").split(',').filter(|m| !m.is_empty()).map(str::to_string));
+        }
+    }
+    if let Some(gid) = gid {
+        for l in std::fs::read_to_string("/etc/passwd").unwrap_or_default().lines() {
+            let f: Vec<&str> = l.split(':').collect();
+            if f.get(3).and_then(|g| g.parse::<u32>().ok()) == Some(gid) {
+                v.push(f[0].to_string());
+            }
+        }
+    }
+    v.sort();
+    v.dedup();
     v
 }
 

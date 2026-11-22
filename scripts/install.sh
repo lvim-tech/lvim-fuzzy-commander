@@ -1,6 +1,6 @@
 #!/bin/sh
-# Build lvim-commander and install it for the current user:
-#   ~/.local/bin/lvim-commander               the binary (PREFIX overrides ~/.local)
+# Build lvim-fuzzy-commander and install it for the current user:
+#   ~/.local/bin/lvim-fuzzy-commander         the binary (PREFIX overrides ~/.local)
 #   ~/.local/bin/lvc                          a short name (symlink)
 #   ~/.config/lvim-commander/themes/*.toml    the lvim themes, from an lvim-colorscheme checkout next to
 #                                             this one (LVIM_COLORSCHEME=path); existing files are kept
@@ -9,11 +9,11 @@ cd "$(dirname "$0")/.."
 prefix=${PREFIX:-$HOME/.local}
 cargo build --release
 mkdir -p "$prefix/bin"
-install -m 755 target/release/lvim-commander "$prefix/bin/lvim-commander"
-ln -sf lvim-commander "$prefix/bin/lvc"
-echo "installed: $prefix/bin/lvim-commander, $prefix/bin/lvc"
+install -m 755 ${CARGO_TARGET_DIR:-target}/release/lvim-fuzzy-commander "$prefix/bin/lvim-fuzzy-commander"
+ln -sf lvim-fuzzy-commander "$prefix/bin/lvc"
+echo "installed: $prefix/bin/lvim-fuzzy-commander, $prefix/bin/lvc"
 # the Material icons, shared with lvim-icons and lvim-fuzzy: written when missing there or older
-"$prefix/bin/lvim-commander" --install-icons
+"$prefix/bin/lvim-fuzzy-commander" --install-icons
 themes=${XDG_CONFIG_HOME:-$HOME/.config}/lvim-commander/themes
 src=${LVIM_COLORSCHEME:-../lvim-colorscheme}/extras/lvim_commander
 if [ -d "$src" ]; then

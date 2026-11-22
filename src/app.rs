@@ -40,12 +40,56 @@ enum InputAction {
     MoveTo(Vec<PathBuf>),
     Mark(bool),
     Goto,
+    /// the command goes to the shell under the panels, which is shown
     Shell,
     Chmod(Vec<PathBuf>),
     Chown(Vec<PathBuf>),
     Compress(PathBuf, Vec<String>),
     /// links to these in this directory; `relative`: the link holds a relative path (Tab toggles)
     Symlink { targets: Vec<PathBuf>, dir: PathBuf, relative: bool },
+    /// the password of a connection, asked after it was refused (kept for this session only)
+    RemotePassword { remote: String },
+    /// the permissions of these remote paths
+    RemoteChmod { remote: String, paths: Vec<String> },
+    /// the owner and group of these remote paths
+    RemoteChown { remote: String, paths: Vec<String> },
+    /// a symbolic link in a remote directory to this path
+    RemoteLink { remote: String, dir: String, target: String },
+    /// a new file / directory in a remote directory (a name ending in / is a directory)
+    RemoteNew { remote: String, dir: String },
+    /// rename inside a remote
+    RemoteRename { remote: String, path: String },
+    /// the buffer pasted with a target the user edits (may end in a rename mask); `cut`: the buffer is emptied
+    PasteTo(Vec<PathBuf>, bool),
+}
+
+/// A row of the info dialog: a label and the value's pieces, each with the theme colour it is drawn in (`mode`: the
+/// permissions as the listing draws them).
+struct InfoRow {
+    label: &'static str,
+    value: Vec<(String, &'static str)>,
+}
+
+/// The users and groups of a remote machine (what `users` of the plugin answered): the owner dialog is made of them.
+#[derive(Clone, Debug, Default)]
+struct RemoteIds {
+    remote: String,
+    /// name, uid, primary gid
+    users: Vec<(String, u32, u32)>,
+    /// name, gid, members
+    groups: Vec<(String, u32, Vec<String>)>,
+}
+
+impl RemoteIds {
+    /// The people of a group: the ones it lists and the ones whose primary group it is.
+    fn members(&self, group: &str) -> Vec<String> {
+        let Some((_, gid, listed)) = self.groups.iter().find(|(n, _, _)| n == group) else { return Vec::new() };
+        let mut v = listed.clone();
+        v.extend(self.users.iter().filter(|(_, _, g)| g == gid).map(|(n, _, _)| n.clone()));
+        v.sort();
+        v.dedup();
+        v
+    }
 }
 
 /// What a yes/no dialog confirms.
@@ -54,11 +98,23 @@ enum ConfirmAction {
     /// Yes calls a plugin function (a `confirm` instruction).
     Plugin(PluginCall),
     Delete(Vec<PathBuf>, bool),
+    /// delete these (path, is a directory) of a remote for good
+    RemoteRm { remote: String, items: Vec<(String, bool)> },
+    /// delete a saved connection
+    SiteDelete(String),
     Purge(Vec<crate::trash::Item>),
     EmptyTrash,
 }
 
 enum Dialog {
+    /// `r c`: every connection with its state; Enter connects, or disconnects when it is connected
+    Connections { rows: Vec<ConnRow>, sel: usize },
+    /// A remote connection being made or changed: rows are the name, the engine, the engine's fields, OK, Cancel
+    Site { name: String, locked: bool, ty: usize, vals: std::collections::BTreeMap<String, String>, focus: usize, open: Option<SiteList>, sugg: Suggest, note: String },
+    /// `vi`: the facts of a file, each in its own colour
+    Info { title: String, rows: Vec<InfoRow> },
+    /// the task manager: the running operations; `x` cancels the selected one
+    Tasks { sel: usize },
     Input {
         title: String,
         value: String,
@@ -81,6 +137,8 @@ enum Dialog {
     /// Ctrl-c m: the permissions, as a field (octal or symbolic) and as ticks; each follows the other.
     Mode {
         paths: Vec<PathBuf>,
+        /// the remote the paths are of (remote paths), when it is a remote panel's
+        remote: Option<String>,
         value: String,
         cur: usize,
         /// the mode the field is read against (symbolic `u+x` is relative to it)
@@ -98,7 +156,11 @@ enum Dialog {
         groups: Vec<String>,
         user: usize,
         group: usize,
-        /// 0 = user, 1 = group, 2 = OK, 3 = Cancel
+        /// the people of the chosen group: the user drop-down lists only them
+        members: Vec<String>,
+        /// the remote machine the lists are of (the paths are then remote paths)
+        remote: Option<RemoteIds>,
+        /// 0 = group, 1 = user, 2 = OK, 3 = Cancel
         focus: usize,
         /// an open drop-down: (the query typed, the selected row among the matches)
         open: Option<(String, usize)>,
@@ -123,6 +185,10 @@ enum MenuItem {
     /// A `menu` instruction's entry: the plugin function to call, with an optional argument.
     Plugin(PluginCall, Option<String>),
     Dir(PathBuf),
+    /// Change this connection
+    RemoteEdit(String),
+    /// Delete this connection
+    RemoteDelete(String),
     /// An index into `App::actions`.
     Action(usize),
     /// A built-in operation (the F9 menu lists them before the user actions).
@@ -177,9 +243,10 @@ enum Builtin {
 const CHORDS: &[(&str, &str, u8, &str)] = &[
     ("f", "find files", 1, "find"),
     ("g", "grep", 1, "grep"),
-    ("c", "go to dir", 0, "goto"),
+    ("c", "directory", 0, "goto"),
     ("b", "bookmarks", 0, "bookmarks"),
-    ("x", "shell", 1, "shell"),
+    ("x", "run command", 1, "shell"),
+    ("{", "shell", 0, "subshell"),
     ("t", "trash", 0, "trash-view"),
     ("r", "restore", 2, "restore"),
     ("e", "empty trash", 2, "empty-trash"),
@@ -196,6 +263,32 @@ const CHORDS: &[(&str, &str, u8, &str)] = &[
     ("l", "long view", 0, "long"),
     ("v", "columns", 0, "columns"),
     ("n", "new tab", 0, "new-tab"),
+    (";", "file info", 0, "info"),
+    ("G", "my computer", 0, "local"),
+    ("Z", "zoom", 0, "zoom"),
+    ("V", "view file", 0, "viewer"),
+    ("R", "refresh", 0, "refresh"),
+    ("U", "redo", 0, "redo"),
+    ("/", "sync browsing", 0, "sync"),
+    ("'", "connections", 0, "remote-list"),
+    ("}", "new connection", 0, "remote-add"),
+    ("\"", "edit connection", 0, "remote-edit"),
+    (":", "delete connection", 0, "remote-delete"),
+    ("!", "tasks", 0, "tasks"),
+    ("=", "compare", 1, "compare"),
+    ("@", "copy files", 1, "yank"),
+    ("#", "cut files", 1, "cut"),
+    ("$", "paste here", 1, "paste"),
+    ("%", "paste other", 1, "paste-other"),
+    ("^", "paste symlinks", 1, "paste-link"),
+    ("&", "paste hardlinks", 1, "paste-hard"),
+    ("_", "paste renamed", 1, "paste-rename"),
+    ("~", "paste copies", 1, "paste-copy"),
+    ("`", "paste clipboard", 1, "paste-clipboard"),
+    ("|", "show buffer", 0, "buffer-view"),
+    ("\\", "clear buffer", 0, "buffer-drop"),
+    (")", "next tab", 0, "tab-next"),
+    ("(", "previous tab", 0, "tab-prev"),
     (",", "rename tab", 0, "rename-tab"),
     ("<", "tab left", 0, "tab-left"),
     (">", "tab right", 0, "tab-right"),
@@ -208,42 +301,280 @@ const CHORDS: &[(&str, &str, u8, &str)] = &[
     ("s", "sort", 0, "sort"),
     ("S", "reverse", 0, "reverse"),
     ("p", "swap panels", 0, "swap"),
-    ("o", "dir → other", 0, "dir-to-other"),
-    ("i", "here → other", 0, "here-to-other"),
+    ("o", "send dir", 0, "dir-to-other"),
+    ("i", "same place", 0, "here-to-other"),
     ("[", "back", 0, "back"),
     ("]", "forward", 0, "forward"),
     ("r", "reload", 1, "reload"),
     ("?", "help", 0, "keys-help"),
-    ("H", "hide hints", 0, "hints"),
+    ("H", "hide bar", 0, "hints"),
     ("q", "quit", 0, "exit"),
 ];
 
+/// The key groups: a first letter, then the command's letter (`tn` next tab, `ma` mark all). Each entry is
+/// (key, what it does): a name of `config::COMMANDS`, or one of the few the group handles itself
+/// (`top`, `tab 1..9`). The bottom row shows the groups, a group's popup its keys; `[keys]` still moves any
+/// command to a key of its own.
+const GROUPS: &[(char, &str, &[(&str, &str)])] = &[
+    ('t', "tabs", &[
+        ("N", "new-tab"), ("n", "tab-next"), ("p", "tab-prev"), ("d", "close-tab"), ("e", "rename-tab"),
+        ("<", "tab-left"), (">", "tab-right"), ("i", "instances"),
+    ]),
+    ('m', "marks", &[("a", "mark-all"), ("*", "invert-marks"), ("+", "mark-glob"), ("-", "unmark-glob")]),
+    ('a', "actions", &[
+        ("z", "compress"), ("e", "extract"), ("m", "chmod"), ("o", "chown"), ("L", "symlink"), ("x", "shell"),
+        ("u", "undo"), ("U", "redo"), ("s", "subshell"), ("r", "restore"), ("E", "empty-trash"), ("q", "exit"),
+    ]),
+    ('y', "yank", &[("y", "yank"), ("x", "cut"), ("p", "copy-path"), ("n", "copy-name"), ("d", "copy-dir")]),
+    ('p', "paste", &[
+        ("p", "paste"), ("o", "paste-other"), ("l", "paste-link"), ("h", "paste-hard"), ("r", "paste-rename"),
+        ("c", "paste-copy"), ("m", "paste-clipboard"), ("v", "buffer-view"), ("d", "buffer-drop"),
+    ]),
+    ('f', "find", &[("f", "find"), ("g", "grep")]),
+    ('g', "go", &[
+        ("g", "top"), ("c", "goto"), ("b", "bookmarks"), ("t", "trash-view"), ("[", "back"), ("]", "forward"),
+        ("o", "dir-to-other"), ("i", "here-to-other"), ("G", "local"), ("?", "keys-help"),
+    ]),
+    ('o', "operations", &[
+        ("c", "copy"), ("m", "move"), ("r", "refresh"), ("R", "rename-tab"), ("N", "rename"), ("s", "here-to-other"), ("n", "new"), ("e", "edit"), ("d", "trash"), ("D", "delete"),
+        ("o", "menu"), ("t", "tasks"),
+    ]),
+    ('r', "remote", &[("c", "remote-list"), ("l", "remote-list"), ("a", "remote-add"), ("e", "remote-edit"), ("d", "remote-delete")]),
+    ('v', "view", &[
+        ("v", "view"), ("i", "info"), ("z", "zoom"), ("f", "viewer"), ("d", "compare"), ("b", "sync"), ("c", "columns"), ("l", "long"), ("h", "hidden"), ("s", "sort"), ("S", "reverse"),
+        ("w", "swap"), ("r", "reload"), ("H", "hints"),
+    ]),
+];
+
+/// An archive being unpacked into the cache so a panel can enter it.
+/// Tab completion on the command line: where the word starts (chars), what can replace it, which one is in, and how
+/// long what stands there now is.
+struct Comp {
+    start: usize,
+    cands: Vec<String>,
+    idx: Option<usize>,
+    len: usize,
+}
+
+/// A row of the connections list.
+#[derive(Clone)]
+struct ConnRow {
+    name: String,
+    engine: String,
+    detail: String,
+    /// where it opens (its `path`, or the engine's own start)
+    start: String,
+}
+
+/// Which menu the remotes are wanted for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NamesFor {
+    Open,
+    Edit,
+    Delete,
+}
+
+/// The kinds of connection the form offers, in plain words: (what it is, engine, how a mount is made).
+const SITE_TYPES: [(&str, &str, &str); 6] = [
+    ("SFTP — a server you log in to with SSH (most servers)", "sftp", ""),
+    ("FTP — an older file server", "ftp", ""),
+    ("Cloud or other — a remote made with `rclone config` (Google Drive, S3, WebDAV …)", "rclone", ""),
+    ("A server opened as a folder — with sshfs", "mount", "sshfs"),
+    ("An rclone remote opened as a folder", "mount", "rclone"),
+    ("Something mounted with a command of my own", "mount", ""),
+];
+
+/// Where a field's suggestions come from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pick {
+    None,
+    Hosts,
+    Keys,
+    Remotes,
+}
+
+/// One line of a connection's form: the key in the settings, the label, where suggestions come from, the hint (what to type).
+struct SiteField {
+    key: &'static str,
+    label: &'static str,
+    pick: Pick,
+    hint: &'static str,
+}
+
+fn site_fields(ty: usize) -> Vec<SiteField> {
+    let f = |key, label, pick, hint| SiteField { key, label, pick, hint };
+    match ty {
+        0 => vec![
+            f("host", "Server", Pick::Hosts, "its address, or a name from ~/.ssh/config"),
+            f("port", "Port", Pick::None, "22"),
+            f("user", "User name", Pick::None, "your user name on the server"),
+            f("key", "Key file", Pick::Keys, "none: the ssh-agent, or the password it asks for"),
+            f("path", "Start in", Pick::None, "~ is your home folder"),
+        ],
+        1 => vec![
+            f("host", "Server", Pick::None, "e.g. ftp.example.org"),
+            f("port", "Port", Pick::None, "21"),
+            f("user", "User name", Pick::None, "empty: anonymous"),
+            f("path", "Start in", Pick::None, "/"),
+        ],
+        2 => vec![f("remote", "Remote", Pick::Remotes, "one made with `rclone config`"), f("path", "Start in", Pick::None, "empty: its top")],
+        3 => vec![
+            f("host", "Server", Pick::Hosts, "its address, or a name from ~/.ssh/config"),
+            f("user", "User name", Pick::None, "your user name on the server"),
+            f("port", "Port", Pick::None, "22"),
+            f("key", "Key file", Pick::Keys, "none: the ssh-agent"),
+            f("folder", "Open folder", Pick::None, "empty: your home folder on the server"),
+        ],
+        4 => vec![f("remote", "Remote", Pick::Remotes, "one made with `rclone config`"), f("folder", "Open folder", Pick::None, "empty: its top")],
+        _ => vec![
+            f("mount", "Mount command", Pick::None, "e.g. sshfs me@host: {mnt}"),
+            f("root", "Mounted on", Pick::None, "or: the folder it is mounted on already"),
+        ],
+    }
+}
+
+/// What a form's drop-down offers: the lists are read when the form opens.
+#[derive(Clone, Default)]
+struct Suggest {
+    hosts: Vec<String>,
+    keys: Vec<String>,
+    remotes: Vec<String>,
+}
+
+/// An open drop-down of the form: (shown, value) rows, the selected one, the filter typed.
+#[derive(Clone)]
+struct SiteList {
+    items: Vec<(String, String)>,
+    sel: usize,
+    query: String,
+}
+
+impl SiteList {
+    fn matches(&self) -> Vec<usize> {
+        let q = self.query.to_lowercase();
+        self.items.iter().enumerate().filter(|(_, (shown, _))| shown.to_lowercase().contains(&q)).map(|(i, _)| i).collect()
+    }
+}
+
+/// What redo does again (what undo took back).
+#[derive(Clone)]
+enum Redo {
+    /// move `from` to `to` again
+    Move { from: PathBuf, to: PathBuf },
+    /// move this path to the trash again
+    Trash(PathBuf),
+    /// put this trashed item back again
+    Restore(crate::trash::Item),
+}
+
+/// What is done with a remote file once its copy is in the cache.
+#[derive(Clone)]
+enum AfterFetch {
+    /// nothing: the quick view finds the copy by itself
+    Preview,
+    /// open it as a local file is opened
+    Open,
+    /// unpack the archive into this directory
+    Extract(PathBuf),
+    /// enter the archive as a directory
+    Archive,
+    /// edit it, then put it back when it changed: (remote, path in it)
+    Edit(String, String),
+}
+
+/// A download to the cache on its way.
+struct Fetch {
+    cache: PathBuf,
+    then: AfterFetch,
+}
+
+/// What a call to the remote plugin was for.
+enum RemoteTask {
+    /// the listing of a panel's directory
+    List,
+    /// the remotes there are, for a menu
+    Names(NamesFor),
+    /// a disconnect on its way (the name, for the message)
+    Disconnect(String),
+    /// the users and groups of the remote machine, for the owner dialog of these remote paths (and the entry's owner ids)
+    Users { remote: String, paths: Vec<String>, owner: (u32, u32) },
+}
+
+struct ArcEnter {
+    /// the job that unpacks it
+    job: u32,
+    tab: usize,
+    panel: usize,
+    archive: PathBuf,
+    root: PathBuf,
+}
+
+/// Visual mode: marks follow the cursor from where `V` was pressed.
+struct Visual {
+    tab: usize,
+    panel: usize,
+    anchor: usize,
+    base: std::collections::BTreeSet<String>,
+}
+
+/// What a group's second key means.
+enum GroupHit {
+    Top,
+    Tab(usize),
+    /// the command's canonical key (after the leader)
+    Command(KeyCode),
+    /// an F-key action (`view`): its own F-key
+    Fkey(KeyEvent),
+    None,
+}
+
+impl App {
+    fn group_command(&self, g: char, c: char) -> GroupHit {
+        if g == 't' && ('1'..='9').contains(&c) {
+            return GroupHit::Tab(c as usize - '1' as usize);
+        }
+        let Some((_, _, keys)) = GROUPS.iter().find(|(n, _, _)| *n == g) else { return GroupHit::None };
+        let Some((_, name)) = keys.iter().find(|(k, _)| k.chars().next() == Some(c)) else { return GroupHit::None };
+        if *name == "top" {
+            return GroupHit::Top;
+        }
+        if let Some((_, _, canon)) = self.fkeys.iter().find(|(n, _, _)| n == name) {
+            return GroupHit::Fkey(KeyEvent::new(canon.code, canon.modifiers));
+        }
+        let Some((_, def)) = crate::config::COMMANDS.iter().find(|(n, _)| n == name) else { return GroupHit::None };
+        match crate::plugins::KeySpec::parse(def) {
+            Some(ks) => GroupHit::Command(ks.code),
+            None => GroupHit::None,
+        }
+    }
+}
+
 const BUILTINS: &[(Builtin, &str, &str)] = &[
-    (Builtin::Copy, "Copy", "F3"),
-    (Builtin::Move, "Move", "F5"),
-    (Builtin::Rename, "Rename", "F4"),
-    (Builtin::NewFile, "New file or directory (name/)", "F7"),
-    (Builtin::Trash, "Move to the trash", "F8"),
-    (Builtin::Delete, "Delete for good", "S-F8"),
-    (Builtin::Chmod, "Change the mode (permissions)", "C-c m"),
-    (Builtin::Chown, "Change the owner and group", "C-c O"),
-    (Builtin::Compress, "Compress", "C-c z"),
-    (Builtin::Extract, "Extract", "C-c e"),
-    (Builtin::Edit, "Edit", "F6"),
-    (Builtin::View, "Quick view", "F2"),
-    (Builtin::Find, "Find files (lvim-fuzzy)", "C-c f"),
-    (Builtin::Grep, "Grep (lvim-fuzzy)", "C-c g"),
-    (Builtin::Goto, "Go to a directory", "C-c c"),
-    (Builtin::Bookmarks, "Bookmarks · recent", "C-c b"),
-    (Builtin::Shell, "Shell command here", "C-c x"),
-    (Builtin::TrashView, "The trash", "C-c t"),
+    (Builtin::Copy, "Copy", "o c"),
+    (Builtin::Move, "Move", "o m"),
+    (Builtin::Rename, "Rename", "o r"),
+    (Builtin::NewFile, "New file or directory (name/)", "o n"),
+    (Builtin::Trash, "Move to the trash", "o d"),
+    (Builtin::Delete, "Delete for good", "o D"),
+    (Builtin::Chmod, "Change the mode (permissions)", "a m"),
+    (Builtin::Chown, "Change the owner and group", "a o"),
+    (Builtin::Compress, "Compress", "a z"),
+    (Builtin::Extract, "Extract", "a e"),
+    (Builtin::Edit, "Edit", "o e"),
+    (Builtin::View, "Quick view", "v v"),
+    (Builtin::Find, "Find files (lvim-fuzzy)", "f f"),
+    (Builtin::Grep, "Grep (lvim-fuzzy)", "f g"),
+    (Builtin::Goto, "Go to a directory", "g c"),
+    (Builtin::Bookmarks, "Bookmarks · recent", "g b"),
+    (Builtin::Shell, "Run a command in the shell", "a x"),
+    (Builtin::TrashView, "The trash", "g t"),
     (Builtin::Hidden, "Show / hide hidden files", "."),
-    (Builtin::Long, "Long view", "C-c l"),
-    (Builtin::Sort, "Sort order", "C-c s"),
-    (Builtin::Swap, "Swap the panels", "C-c p"),
-    (Builtin::Undo, "Undo", "C-c u"),
-    (Builtin::Reload, "Reload", "C-c r"),
-    (Builtin::Help, "Keys", "F1"),
+    (Builtin::Long, "Long view", "v l"),
+    (Builtin::Sort, "Sort order", "v s"),
+    (Builtin::Swap, "Swap the panels", "v w"),
+    (Builtin::Undo, "Undo", "a u"),
+    (Builtin::Reload, "Reload", "v r"),
+    (Builtin::Help, "Keys", "?"),
 ];
 
 /// What a background user action reports back.
@@ -258,6 +589,7 @@ struct ActionDone {
 }
 
 struct RunningJob {
+    id: u32,
     job: Job,
     done: u64,
     total: u64,
@@ -283,21 +615,49 @@ pub struct App {
     fkeys: Vec<(&'static str, crate::plugins::KeySpec, KeyEvent)>,
     /// `[keys]` for every other command: (name, the key it is on now, its default key).
     cmdkeys: Vec<(&'static str, crate::plugins::KeySpec, crate::plugins::KeySpec)>,
-    /// The key that starts a command (`leader`), as the bar shows it (C-c) and in words (Ctrl-c).
-    leader: crate::plugins::KeySpec,
-    leader_label: String,
-    leader_name: String,
     /// a press made by lvc itself (a button of the bar): already the action's own F-key, not translated
     synthetic: bool,
     /// Ctrl-j: the focus is on the button bar (the F-keys), at this button; h / l move, Enter presses
     footer_focus: Option<usize>,
-    /// `g` was typed in the list: a second `g` goes to the top (gg, as in Neovim)
-    pending_g: bool,
+    /// Ctrl-k from the panels: the tab bar has the focus, this tab is lit
+    tab_focus: Option<usize>,
     /// where the buttons were drawn (x from, x to, the F-key), for the mouse
-    footer_btns: Vec<(u16, u16, u8)>,
+    footer_btns: Vec<(u16, u16, char)>,
+    /// the first button shown when the bar is longer than the screen
+    footer_off: usize,
     footer_y: u16,
     /// Ctrl-c H: whether the bar of the Ctrl-c commands shows
     chord_hints: bool,
+    /// the first letter of a key group, waiting for the second
+    group: Option<char>,
+    /// the command line's history (`:` / `ax`), and where Up / Down are in it
+    shell_history: Vec<String>,
+    hist_at: usize,
+    comp: Option<Comp>,
+    /// the client of the remote plugin (loaded when first needed), and what each call on its way is for
+    remote: Option<lvim_fuzzy_plugin::Remote>,
+    remote_tasks: std::collections::HashMap<u64, RemoteTask>,
+    /// synchronized browsing (`vb`): the other panel goes where this one goes, one directory at a time
+    sync_browse: bool,
+    /// `vz`: the active panel has the whole screen
+    zoom: bool,
+    /// vf: the file under the cursor on the whole screen (a viewer in place), closed with Esc / q
+    viewer: bool,
+    /// the downloads to the cache on their way (by job), the files being downloaded, the ones that failed, what waits to be done
+    fetch_jobs: std::collections::HashMap<u32, Fetch>,
+    fetching: std::collections::HashSet<PathBuf>,
+    fetch_failed: std::collections::HashMap<PathBuf, String>,
+    after_fetch: Vec<(PathBuf, AfterFetch)>,
+    /// the passwords typed this session (never written down), by connection
+    session_pw: std::collections::HashMap<String, String>,
+    /// the shell under the panels (`Ctrl-o`), alive between visits
+    subshell: Option<crate::subshell::Subshell>,
+    /// an archive being unpacked to be entered
+    arc_enter: Option<ArcEnter>,
+    /// `--chooser-file`: Enter on a file (or on the marks) writes the chosen paths here and quits
+    chooser: Option<PathBuf>,
+    /// visual mode (`V`): the tab, the panel, the row it started on and the marks from before; the cursor's range is marked
+    visual: Option<Visual>,
     cfg: Config,
     look: Look,
     panels: [Panel; 2],
@@ -322,7 +682,11 @@ pub struct App {
     /// how many entries a directory holds, for the size column: path → (its mtime, the count)
     dir_counts: DirCounts,
     dialog: Option<Dialog>,
-    job: Option<RunningJob>,
+    /// the operations running at once (the task manager, `ot`, lists them); each is its own thread
+    jobs: Vec<RunningJob>,
+    next_job: u32,
+    /// conflicts a job asked about while another dialog was open
+    asks: std::collections::VecDeque<(PathBuf, std::sync::mpsc::Sender<(ops::Conflict, bool)>)>,
     toast: Option<Toast>,
     help: bool,
     /// The help's selected row and its scroll.
@@ -365,6 +729,8 @@ pub struct App {
     searching: bool,
     /// What Ctrl-z takes back, newest last (one entry per operation).
     undo: Vec<Vec<ops::Undo>>,
+    /// what `R` does again: the last undone first
+    redo: Vec<Vec<Redo>>,
     /// Directories visited, newest first (Alt-b).
     recent: Vec<PathBuf>,
     /// The plugin host: starts plugins on their first call, collects their answers (lvim-plugin).
@@ -429,7 +795,9 @@ impl App {
             cols: crate::config::load_state().cols,
             dir_counts: Default::default(),
             dialog: None,
-            job: None,
+            jobs: Vec::new(),
+            next_job: 1,
+            asks: Default::default(),
             toast: None,
             help: false,
             help_sel: 0,
@@ -476,16 +844,33 @@ impl App {
                     (*n, key, canon)
                 })
                 .collect(),
-            leader_label: key_label(&cfg.leader.text),
-            leader_name: key_label(&cfg.leader.text).replace("C-", "Ctrl-").replace("A-", "Alt-"),
-            leader: cfg.leader.clone(),
             synthetic: false,
             footer_focus: None,
-            pending_g: false,
+            tab_focus: None,
             footer_btns: Vec::new(),
+            footer_off: 0,
             footer_y: 0,
             chord_hints: cfg.key_hints,
+            group: None,
+            visual: None,
+            chooser: None,
+            arc_enter: None,
+            subshell: None,
+            remote: None,
+            remote_tasks: Default::default(),
+            session_pw: Default::default(),
+            sync_browse: false,
+            zoom: false,
+            viewer: false,
+            fetch_jobs: Default::default(),
+            fetching: Default::default(),
+            fetch_failed: Default::default(),
+            after_fetch: Vec::new(),
+            shell_history: crate::config::load_shell_history(),
+            hist_at: 0,
+            comp: None,
             undo: Vec::new(),
+            redo: Vec::new(),
             recent: Vec::new(),
             cfg,
             look,
@@ -550,6 +935,11 @@ impl App {
                     format!("{}\t{}\t{}\t{}", std::process::id(), dir(&self.panels[0]), dir(&self.panels[1]), self.active);
             }
             self.pump_job();
+            self.remote_sync();
+            self.pump_remote();
+            if !self.after_fetch.is_empty() {
+                self.run_after_fetch(term)?;
+            }
             let cv = self.draw(term.w, term.h);
             term.draw(cv)?;
             if self.quit {
@@ -564,7 +954,7 @@ impl App {
             // a job's progress, a message's expiry.
             let timeout = if self.drawer.take_wait() {
                 Duration::from_millis(10)
-            } else if self.job.is_some() {
+            } else if !self.jobs.is_empty() {
                 Duration::from_millis(80)
             } else {
                 Duration::from_millis(500)
@@ -695,67 +1085,298 @@ impl App {
     // ── jobs ────────────────────────────────────────────────────────────────────────────────────────
 
     fn start_job(&mut self, kind: JobKind, sources: Vec<PathBuf>, dest: Option<PathBuf>) {
+        self.start_job_masked(kind, sources, dest, None)
+    }
+
+    fn start_job_masked(&mut self, kind: JobKind, sources: Vec<PathBuf>, dest: Option<PathBuf>, mask: Option<String>) {
         if sources.is_empty() {
             return;
         }
-        if self.job.is_some() {
-            self.toast("another operation is running", true);
-            return;
-        }
-        self.job = Some(RunningJob {
-            job: wake_on(ops::start(kind, sources, dest), self.wake_tx.clone()),
-            done: 0,
-            total: 0,
-            file: String::new(),
-            started: Instant::now(),
-        });
+        let job = wake_on(ops::start(kind, sources, dest, mask), self.wake_tx.clone());
+        self.add_job(job);
     }
 
+    fn add_job(&mut self, job: Job) -> u32 {
+        let id = self.next_job;
+        self.next_job += 1;
+        self.jobs.push(RunningJob { id, job, done: 0, total: 0, file: String::new(), started: Instant::now() });
+        id
+    }
+
+    /// Read what every running operation reports: progress, a conflict to ask about, the end.
     fn pump_job(&mut self) {
-        let Some(rj) = self.job.as_mut() else { return };
-        loop {
-            match rj.job.rx.try_recv() {
-                Ok(Report::Progress { done, total, file }) => {
-                    rj.done = done;
-                    rj.total = total;
-                    rj.file = file;
-                }
-                Ok(Report::Ask { target, answer }) => {
-                    self.dialog = Some(Dialog::Conflict { target, answer });
-                    return;
-                }
-                Ok(Report::Done { count, errors, undo }) => {
-                    let kind = rj.job.kind;
-                    self.job = None;
-                    if !undo.is_empty() {
-                        self.undo.push(undo);
+        let mut i = 0;
+        while i < self.jobs.len() {
+            let mut finished = None;
+            loop {
+                let rj = &mut self.jobs[i];
+                match rj.job.rx.try_recv() {
+                    Ok(Report::Progress { done, total, file }) => {
+                        rj.done = done;
+                        rj.total = total;
+                        rj.file = file;
                     }
-                    for p in &mut self.panels {
-                        p.marked.clear();
-                        p.reload();
+                    Ok(Report::Ask { target, answer }) => self.asks.push_back((target, answer)),
+                    Ok(Report::Done { count, errors, undo }) => {
+                        finished = Some((count, errors, undo));
+                        break;
                     }
-                    if errors.is_empty() {
-                        self.toast(format!("{}: {count} done", kind.label()), false);
-                    } else {
-                        self.dialog = Some(Dialog::Message {
-                            title: format!("{}: {count} done, {} failed", kind.label(), errors.len()),
-                            lines: errors,
-                        });
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        finished = Some((0, Vec::new(), Vec::new()));
+                        break;
                     }
-                    return;
-                }
-                Err(TryRecvError::Empty) => return,
-                Err(TryRecvError::Disconnected) => {
-                    self.job = None;
-                    return;
                 }
             }
+            let Some((count, errors, undo)) = finished else {
+                i += 1;
+                continue;
+            };
+            let rj = self.jobs.remove(i);
+            let kind = rj.job.kind;
+            if self.arc_enter.as_ref().is_some_and(|a| a.job == rj.id) {
+                let a = self.arc_enter.take().expect("checked above");
+                if errors.is_empty() {
+                    // the archive is unpacked: enter it (not an operation to undo)
+                    let _ = std::fs::write(a.root.with_file_name("done"), "");
+                    if self.tab == a.tab && a.panel < 2 {
+                        self.panels[a.panel].enter_archive(a.archive, a.root);
+                        self.pv_follow();
+                    }
+                    continue;
+                }
+            }
+            if let Some(f) = self.fetch_jobs.remove(&rj.id) {
+                self.fetching.remove(&f.cache);
+                if errors.is_empty() && f.cache.exists() {
+                    self.after_fetch.push((f.cache, f.then));
+                } else {
+                    let why = errors.first().cloned().unwrap_or_else(|| "the server did not let the file be downloaded".into());
+                    self.fetch_failed.insert(f.cache, why.clone());
+                    // a preview that cannot be had is said in its place, not in a dialog on every file the cursor passes
+                    if matches!(f.then, AfterFetch::Preview) {
+                        self.toast(format!("no preview: {why}"), true);
+                    } else {
+                        self.dialog = Some(Dialog::Message { title: "Download failed".into(), lines: errors });
+                    }
+                }
+                continue;
+            }
+            if !undo.is_empty() {
+                self.redo.clear();
+                self.undo.push(undo);
+            }
+            for p in &mut self.panels {
+                p.marked.clear();
+                p.reload();
+            }
+            if errors.is_empty() {
+                self.toast(format!("{}: {count} done", kind.label()), false);
+            } else {
+                self.dialog = Some(Dialog::Message {
+                    title: format!("{}: {count} done, {} failed", kind.label(), errors.len()),
+                    lines: errors,
+                });
+            }
+        }
+        // one conflict at a time, when no other dialog is open
+        if self.dialog.is_none()
+            && let Some((target, answer)) = self.asks.pop_front()
+        {
+            self.dialog = Some(Dialog::Conflict { target, answer });
         }
     }
 
     // ── keys ────────────────────────────────────────────────────────────────────────────────────────
 
-    fn key(&mut self, mut k: KeyEvent, term: &mut Term) -> std::io::Result<()> {
+    fn key(&mut self, k: KeyEvent, term: &mut Term) -> std::io::Result<()> {
+        // Esc ends visual mode, the marks stay
+        if self.visual.is_some() && k.code == KeyCode::Esc && self.dialog.is_none() && self.group.is_none() {
+            self.visual = None;
+            return Ok(());
+        }
+        let before = (self.tab, self.active, self.panels[self.active].place.clone());
+        let r = self.key_inner(k, term);
+        // what a panel refused to do (a remote does not let go of the panel but by a disconnect)
+        let said: Vec<String> = self.panels.iter_mut().filter_map(|p| p.notice.take()).collect();
+        if let Some(n) = said.into_iter().next() {
+            self.toast(n, false);
+        }
+        self.visual_update();
+        if self.sync_browse && before.0 == self.tab && before.1 == self.active {
+            self.sync_other_panel(&before.2);
+        }
+        r
+    }
+
+    /// How many pages / points the file in the viewer has (1: none to move among).
+    fn viewer_positions(&self) -> u32 {
+        let Some(path) = self.p().current_path().or_else(|| self.viewer_cache()) else { return 1 };
+        match self.plug_answers.get(&(path, self.plug_skip)) {
+            Some(lvim_fuzzy_ui::provided::Answer::Preview(p)) => p.positions,
+            _ => 1,
+        }
+    }
+
+    /// The cached copy of the remote file under the cursor, when it is there.
+    fn viewer_cache(&self) -> Option<PathBuf> {
+        let (remote, _) = self.p().remote()?;
+        let e = self.p().current().cloned().filter(|e| !e.is_parent() && !e.is_dir())?;
+        let rpath = self.p().remote_path_of(&e)?;
+        Some(lvim_fuzzy_plugin_remote::engine::cache_file(remote, &rpath, e.size, e.mtime))
+    }
+
+    /// The top / the end of what the viewer shows: a Neovim preview gets `gg` / `G`, the built-in one moves its offset.
+    fn preview_edge(&mut self, top: bool) {
+        let cur = self.pcur().map(|p| p.to_string_lossy().into_owned());
+        if let Some(nv) = &self.nvim {
+            let shown = nv.grid.lock().unwrap().shown.clone();
+            if shown.is_some() && shown == cur && cur.as_deref().is_some_and(|c| Path::new(c).is_file()) {
+                nv.input(if top { "gg" } else { "G" });
+                return;
+            }
+        }
+        self.pv_off = if top { 0 } else { 1_000_000 };
+    }
+
+    /// The viewer (vf): j / k / ↑ ↓ a line, Ctrl-d / Ctrl-u / Space / PgDn / PgUp a page, J / K the pages of a document or the points of a
+    /// video, g / G the top / the end, Esc / q / Enter / vf close.
+    fn viewer_key(&mut self, k: KeyEvent) -> std::io::Result<()> {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        match k.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('f') | KeyCode::Char('V') if !ctrl => {
+                self.viewer = false;
+                self.pv_off = 0;
+                self.drawer.forget();
+            }
+            KeyCode::Char('q') if ctrl => self.quit = true,
+            // up onto the tab bar, down onto the button bar, as everywhere
+            KeyCode::Char('k') if ctrl && self.tabs.len() > 1 => self.tab_focus = Some(self.tab),
+            KeyCode::Char('j') if ctrl => self.footer_focus = Some(0),
+            KeyCode::Char('b') if !ctrl => self.scroll_preview(-2, true),
+            KeyCode::Char('j') | KeyCode::Down if !ctrl => self.scroll_preview(1, false),
+            KeyCode::Char('k') | KeyCode::Up if !ctrl => self.scroll_preview(-1, false),
+            KeyCode::Char('e') if ctrl => self.scroll_preview(1, false),
+            KeyCode::Char('y') if ctrl => self.scroll_preview(-1, false),
+            KeyCode::Char('d') if ctrl => self.scroll_preview(1, true),
+            KeyCode::Char('u') if ctrl => self.scroll_preview(-1, true),
+            KeyCode::Char(' ') | KeyCode::PageDown => self.scroll_preview(2, true),
+            KeyCode::PageUp => self.scroll_preview(-2, true),
+            KeyCode::Char('J') => {
+                if !self.seek(1) {
+                    self.scroll_preview(3, false);
+                }
+            }
+            KeyCode::Char('K') => {
+                if !self.seek(-1) {
+                    self.scroll_preview(-3, false);
+                }
+            }
+            KeyCode::Char('g') | KeyCode::Home => self.preview_edge(true),
+            KeyCode::Char('G') | KeyCode::End => self.preview_edge(false),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Synchronized browsing: the active panel went from `old` into a directory or out of one: the other panel does the same
+    /// when it can (a directory of that name is there to go into; the same kind of place).
+    fn sync_other_panel(&mut self, old: &Place) {
+        let now = self.panels[self.active].place.clone();
+        if now == *old {
+            return;
+        }
+        let o = 1 - self.active;
+        enum Move {
+            Down(String),
+            Up,
+        }
+        let step = match (old, &now) {
+            (Place::Dir(a), Place::Dir(b)) if b.parent() == Some(a.as_path()) => b.file_name().map(|n| Move::Down(n.to_string_lossy().into_owned())),
+            (Place::Dir(a), Place::Dir(b)) if a.parent() == Some(b.as_path()) => Some(Move::Up),
+            (Place::Remote { remote: r1, path: a }, Place::Remote { remote: r2, path: b }) if r1 == r2 => {
+                let norm = |p: &str| p.trim_end_matches('/').to_string();
+                let parent_of = |p: &str| crate::panel::remote_parent(p).map(|x| norm(&x));
+                if parent_of(b) == Some(norm(a)) {
+                    Some(Move::Down(norm(b).rsplit('/').next().unwrap_or("").to_string()))
+                } else if parent_of(a) == Some(norm(b)) {
+                    Some(Move::Up)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let Some(step) = step else { return };
+        match step {
+            Move::Up => self.panels[o].up(),
+            Move::Down(name) => {
+                let target = match &self.panels[o].place {
+                    Place::Dir(d) if d.join(&name).is_dir() => Some(Place::Dir(d.join(&name))),
+                    Place::Remote { remote, path } if self.panels[o].entries.iter().any(|e| e.name == name && e.is_dir()) => {
+                        Some(Place::Remote { remote: remote.clone(), path: crate::panel::remote_join(path, &name) })
+                    }
+                    _ => None,
+                };
+                if let Some(t) = target {
+                    self.panels[o].go(t);
+                }
+            }
+        }
+    }
+
+    /// `os` / `gi`: the other panel goes where this one is — a directory of this machine, a directory of a remote (the same
+    /// connection, the same path), or what this panel was entered from when it shows an archive.
+    fn same_place(&mut self) {
+        let o = 1 - self.active;
+        let p = self.p();
+        let target = match &p.archive {
+            Some(a) => a.origin.clone().or_else(|| a.archive.parent().map(|d| Place::Dir(d.to_path_buf()))),
+            None => Some(p.place.clone()),
+        };
+        let Some(target) = target else { return };
+        if self.panels[o].place == target {
+            self.toast("the other panel is here already", false);
+            return;
+        }
+        // from a remote only to a remote (a refusal is said by the panel)
+        self.panels[o].go(target);
+    }
+
+    /// `V`: start visual mode on the cursor's row, or end it (the marks stay).
+    fn toggle_visual(&mut self) {
+        if self.visual.take().is_some() {
+            return;
+        }
+        let (tab, panel) = (self.tab, self.active);
+        let p = self.p();
+        self.visual = Some(Visual { tab, panel, anchor: p.cursor, base: p.marked.clone() });
+        self.visual_update();
+    }
+
+    /// In visual mode the marks are the ones from before plus the rows between the start and the cursor.
+    fn visual_update(&mut self) {
+        let Some(v) = &self.visual else { return };
+        if v.tab != self.tab || v.panel != self.active {
+            self.visual = None;
+            return;
+        }
+        let (lo, hi) = (v.anchor.min(self.panels[v.panel].cursor), v.anchor.max(self.panels[v.panel].cursor));
+        let mut marks = v.base.clone();
+        let p = &self.panels[v.panel];
+        for &i in p.shown.iter().skip(lo).take(hi + 1 - lo) {
+            let e = &p.entries[i];
+            if !e.is_parent() {
+                marks.insert(e.name.clone());
+            }
+        }
+        self.panels[v.panel].marked = marks;
+    }
+
+    fn key_inner(&mut self, mut k: KeyEvent, term: &mut Term) -> std::io::Result<()> {
+        if self.viewer && self.dialog.is_none() && self.footer_focus.is_none() && self.tab_focus.is_none() {
+            return self.viewer_key(k);
+        }
         // the quick view's directory listing is read again after any key (an operation may change it)
         // Shift + a letter as some terminals and multiplexers send it (zellij, the kitty protocol): the
         // letter in lower case with SHIFT. As the upper-case letter, so `H`, `S`, `O`, `G`, `J` work everywhere.
@@ -769,6 +1390,9 @@ impl App {
             self.dialog_key(k, term)?;
             return Ok(());
         }
+        if self.tab_focus.is_some() && !self.help {
+            return self.tab_key(k);
+        }
         if self.footer_focus.is_some() && !self.help {
             return self.footer_key(k, term);
         }
@@ -780,6 +1404,11 @@ impl App {
         }
         if k.code == KeyCode::Char('k') && k.modifiers.contains(KeyModifiers::CONTROL) && !self.help {
             self.chord = false;
+            // with several tabs the first Ctrl-k goes up onto the tab bar, the next one out of lvc
+            if self.tabs.len() > 1 {
+                self.tab_focus = Some(self.tab);
+                return Ok(());
+            }
             crate::mux::move_focus("up");
             return Ok(());
         }
@@ -801,26 +1430,75 @@ impl App {
         }
         let page = self.list_rects[self.active].h.max(1) as isize;
         // an operation runs: Esc cancels it
-        if let Some(rj) = &self.job
+        if let Some(rj) = self.jobs.last()
             && k.code == KeyCode::Esc
+            && self.dialog.is_none()
         {
             rj.job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             return Ok(());
         }
-        // Ctrl-c starts a command: the next key says which (Esc / Ctrl-c again: none)
-        if self.leader.matches(&k, false) && !self.chord {
-            self.chord = true;
-            return Ok(());
+        // a key group: its first letter, then the command's
+        if !self.searching && !self.chord && !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+            if let Some(g) = self.group.take() {
+                if !matches!(k.code, KeyCode::Left | KeyCode::Right) {
+                    self.footer_off = 0;
+                }
+                match k.code {
+                    KeyCode::Esc => {}
+                    KeyCode::Left | KeyCode::Right => {
+                        self.group = Some(g);
+                        self.footer_scroll(if k.code == KeyCode::Left { -1 } else { 1 });
+                    }
+                    KeyCode::Char(c) => match self.group_command(g, c) {
+                        GroupHit::Top => {
+                            self.pm().cursor = 0;
+                            self.pv_follow();
+                        }
+                        GroupHit::Tab(n) => {
+                            if n < self.tabs.len() {
+                                self.go_tab(n);
+                            }
+                        }
+                        GroupHit::Command(code) => {
+                            // as the command's own key, so `[keys]` that moved it does not stop it
+                            k = KeyEvent::new(code, KeyModifiers::NONE);
+                            self.chord = true;
+                            self.synthetic = true;
+                            return self.key(k, term);
+                        }
+                        GroupHit::Fkey(ev) => {
+                            self.synthetic = true;
+                            return self.key(ev, term);
+                        }
+                        GroupHit::None => self.toast(format!("{g} {c}: no such key"), true),
+                    },
+                    _ => {}
+                }
+                return Ok(());
+            }
+            if let KeyCode::Char(c) = k.code
+                && GROUPS.iter().any(|(g, _, _)| *g == c)
+                && !self.help
+            {
+                self.group = Some(c);
+                self.footer_off = 0;
+                return Ok(());
+            }
         }
         let chord = std::mem::take(&mut self.chord);
-        if chord && (k.code == KeyCode::Esc || self.leader.matches(&k, false)) {
-            return Ok(());
-        }
         // [keys]: a key given to an F-key action becomes that action's own F-key; an F-key whose action
         // moved elsewhere does nothing (a press of a bar button is already the action's own key)
         let mut k = k;
         let mut chord = chord;
         let was_synthetic = std::mem::take(&mut self.synthetic);
+        // the F-keys are not bound by default (the commands are in the key groups); a key given in `[keys]` is
+        if !was_synthetic
+            && !chord
+            && matches!(k.code, KeyCode::F(1..=10))
+            && !self.fkeys.iter().any(|(_, ks, canon)| ks.matches(&k, false) && (ks.code != canon.code || ks.mods != canon.modifiers))
+        {
+            return Ok(());
+        }
         if !was_synthetic {
             if let Some((_, _, canon)) = self.fkeys.iter().find(|(_, ks, _)| ks.matches(&k, chord)) {
                 k = *canon;
@@ -849,7 +1527,7 @@ impl App {
                 let on: Vec<_> = self.cmdkeys.iter().filter(|(_, _, c)| c.matches(&k, chord)).collect();
                 if !on.is_empty() && on.iter().all(|(_, u, c)| u != c) {
                     if chord {
-                        self.toast(format!("{}: that command is on another key (F1)", self.leader_name), true);
+                        self.toast("that command is on another key (?)", true);
                     }
                     return Ok(());
                 }
@@ -872,6 +1550,10 @@ impl App {
             self.active = want;
             self.pv_off = 0;
             return Ok(());
+        }
+        // Ctrl-o: the shell under the panels
+        if ctrl && !chord && k.code == KeyCode::Char('o') {
+            return self.subshell(term);
         }
         // Ctrl-f: into (or out of) the query field
         if ctrl && k.code == KeyCode::Char('f') {
@@ -924,7 +1606,6 @@ impl App {
             return Ok(());
         }
         // in the list: vi letters move (j / k / g / G, h / l out of / into a directory), Space marks
-        let gg = std::mem::take(&mut self.pending_g);
         if !self.searching && !ctrl && !alt && !chord {
             let handled = match k.code {
                 KeyCode::Char('j') => {
@@ -935,28 +1616,21 @@ impl App {
                     self.pm().move_by(-1);
                     true
                 }
-                // gg: the top of this panel (one g waits for the second)
-                KeyCode::Char('g') if gg => {
-                    self.pm().cursor = 0;
+                // vi: u takes the last operation back, R does what was taken back again
+                KeyCode::Char('u') => {
+                    self.undo_last();
                     true
                 }
-                // gt / gT: the next / previous tab; g1 … g9: that tab
-                KeyCode::Char('t') if gg => {
-                    let n = self.tabs.len();
-                    self.go_tab((self.tab + 1) % n);
+                KeyCode::Char('R') => {
+                    self.redo_last();
                     true
                 }
-                KeyCode::Char('T') if gg => {
-                    let n = self.tabs.len();
-                    self.go_tab((self.tab + n - 1) % n);
+                KeyCode::Char('V') => {
+                    self.toggle_visual();
                     true
                 }
-                KeyCode::Char(c @ '1'..='9') if gg => {
-                    self.go_tab(c as usize - '1' as usize);
-                    true
-                }
-                KeyCode::Char('g') => {
-                    self.pending_g = true;
+                KeyCode::Char(':') => {
+                    self.command_line();
                     true
                 }
                 KeyCode::Char('G') => {
@@ -1007,6 +1681,15 @@ impl App {
                 self.pv_follow();
                 return Ok(());
             }
+        }
+        // what only a directory on this machine can do
+        if chord
+            && self.p().remote().is_some()
+            && let KeyCode::Char(c) = k.code
+            && "zx;^&_`fgu".contains(c)
+        {
+            self.toast("that works on a folder of this machine only: oc / om / pp move files between it and the remote", true);
+            return Ok(());
         }
         match k.code {
             KeyCode::Tab | KeyCode::BackTab => {
@@ -1084,13 +1767,71 @@ impl App {
             }
             KeyCode::Char('H') if chord => {
                 self.chord_hints = !self.chord_hints;
-                let n = self.leader_name.clone();
-                self.toast(if self.chord_hints { format!("{n} hints on") } else { format!("{n} hints off ({n} H)") }, false);
+                self.toast(if self.chord_hints { "hints on" } else { "hints off (v H)" }, false);
             }
             KeyCode::Char('v') if chord => self.dialog = Some(Dialog::Columns { sel: 0 }),
             KeyCode::Char('n') if chord => self.new_tab(),
             KeyCode::Char('I') if chord => self.instances_menu(),
             KeyCode::Char('w') if chord => self.close_tab(),
+            // a terminal that reports Shift-, / Shift-. instead of the characters < / > is understood too
+            KeyCode::Char('\'') if chord => self.remote_connect(NamesFor::Open),
+            KeyCode::Char('}') if chord => self.site_form(None),
+            KeyCode::Char('"') if chord => self.remote_connect(NamesFor::Edit),
+            KeyCode::Char(':') if chord => self.remote_connect(NamesFor::Delete),
+            KeyCode::Char('/') if chord => {
+                self.sync_browse = !self.sync_browse;
+                self.toast(if self.sync_browse { "synchronized browsing on: the other panel follows into and out of directories" } else { "synchronized browsing off" }, false);
+            }
+            KeyCode::Char('U') if chord => self.redo_last(),
+            KeyCode::Char('G') if chord => {
+                // the way back to this machine that is not a disconnect: the panel returns to its last local folder, the connection stays
+                // (`r c` opens it again at once, and is where it is closed)
+                if self.p().remote().is_some() {
+                    self.pm().leave_remote();
+                    self.toast("back on this machine — the connection stays open (r c shows it, and disconnects)", false);
+                } else {
+                    self.toast("this panel is on this machine already", false);
+                }
+            }
+            KeyCode::Char('R') if chord => {
+                for p in &mut self.panels {
+                    p.reload();
+                }
+                self.toast("refreshed", false);
+            }
+            KeyCode::Char(';') if chord => self.info(),
+            KeyCode::Char('!') if chord => {
+                if self.jobs.is_empty() {
+                    self.toast("no operation is running", false);
+                } else {
+                    self.dialog = Some(Dialog::Tasks { sel: 0 });
+                }
+            }
+            KeyCode::Char('=') if chord => self.compare_panels(),
+            KeyCode::Char('@') if chord => self.yank(false),
+            KeyCode::Char('#') if chord => self.yank(true),
+            KeyCode::Char('$') if chord => self.paste(false, false),
+            KeyCode::Char('%') if chord => self.paste(true, false),
+            KeyCode::Char('~') if chord => self.paste(false, true),
+            KeyCode::Char('^') if chord => self.paste_links(),
+            KeyCode::Char('&') if chord => self.paste_hard(),
+            KeyCode::Char('_') if chord => self.paste_rename(),
+            KeyCode::Char('`') if chord => self.paste_clipboard(),
+            KeyCode::Char('|') if chord => self.buffer_view(),
+            KeyCode::Char('\\') if chord => {
+                crate::config::save_buffer(&crate::config::Buffer::default());
+                self.toast("the buffer is empty", false);
+            }
+            KeyCode::Char(')') if chord => {
+                let n = self.tabs.len();
+                self.go_tab((self.tab + 1) % n);
+            }
+            KeyCode::Char('(') if chord => {
+                let n = self.tabs.len();
+                self.go_tab((self.tab + n - 1) % n);
+            }
+            KeyCode::Char(',') if chord && shift => self.move_tab(-1),
+            KeyCode::Char('.') if chord && shift => self.move_tab(1),
             KeyCode::Char(',') if chord => self.rename_tab(),
             KeyCode::Char('<') if chord => self.move_tab(-1),
             KeyCode::Char('>') if chord => self.move_tab(1),
@@ -1112,11 +1853,19 @@ impl App {
                     self.panels[o].go(Place::Dir(t));
                 }
             }
-            KeyCode::Char('i') if chord => {
-                if let Some(d) = self.p().dir().map(Path::to_path_buf) {
-                    let o = 1 - self.active;
-                    self.panels[o].go(Place::Dir(d));
+            KeyCode::Char('i') if chord => self.same_place(),
+            KeyCode::Char('V') if chord => {
+                if self.pcur().is_some_and(|p| p.is_file()) || self.p().remote().is_some() {
+                    self.viewer = true;
+                    self.pv_off = 0;
+                    self.plug_skip = 0;
+                } else {
+                    self.toast("nothing to view here: put the cursor on a file", false);
                 }
+            }
+            KeyCode::Char('Z') if chord => {
+                self.zoom = !self.zoom;
+                self.toast(if self.zoom { "zoomed: this panel has the whole screen (vz again, or Tab to the other)" } else { "two panels again" }, false);
             }
             KeyCode::Char('r') if chord && self.p().is_trash() => self.restore(),
             KeyCode::Char('e') if chord && self.p().is_trash() => {
@@ -1147,7 +1896,8 @@ impl App {
                 let d = self.p().dir().map(fsx::tilde).unwrap_or_default();
                 self.input("Go to directory", &d, InputAction::Goto)
             }
-            KeyCode::Char('x') if chord => self.input("Shell command", "", InputAction::Shell),
+            KeyCode::Char('x') if chord => self.command_line(),
+            KeyCode::Char('{') if chord => self.subshell(term)?,
             KeyCode::Char('u') if chord => self.undo_last(),
             KeyCode::Char('m') if chord => self.chmod(),
             KeyCode::Char('O') if chord => self.chown(),
@@ -1189,8 +1939,7 @@ impl App {
                 self.delete(direct);
             }
             _ if chord => {
-                let n = self.leader_name.clone();
-                self.toast(format!("{n}: no such command (F1 lists them)"), true)
+                self.toast("no such command (? lists them)", true)
             }
             _ => {}
         }
@@ -1203,9 +1952,10 @@ impl App {
     fn state(&self) -> crate::config::State {
         use crate::config::{PanelSave, TabSave};
         let panel = |p: &Panel| PanelSave {
-            // a panel in the trash has no directory: home takes its place
-            dir: p.dir().map(Path::to_path_buf).unwrap_or_else(fsx::home),
+            // a panel in the trash keeps the directory it came from (home when it has none)
+            dir: p.archive.as_ref().and_then(|a| a.archive.parent().map(Path::to_path_buf)).or_else(|| p.dir().map(Path::to_path_buf)).or_else(|| p.last_dir()).unwrap_or_else(fsx::home),
             cursor: p.current().map(|e| e.name.clone()).filter(|n| n != "..").unwrap_or_default(),
+            trash: p.is_trash(),
         };
         let tabs = (0..self.tabs.len())
             .map(|i| {
@@ -1220,6 +1970,10 @@ impl App {
     }
 
     fn save_state(&mut self) {
+        // a chooser run is a visit, not the way lvc was left
+        if self.chooser.is_some() {
+            return;
+        }
         let st = self.state();
         self.saved_sig = Self::sig(&st);
         crate::config::save_state(&st);
@@ -1229,7 +1983,16 @@ impl App {
     fn sig(st: &crate::config::State) -> String {
         let mut s = format!("{}|{}|{:?}", st.quick, st.tab, st.cols);
         for t in &st.tabs {
-            s += &format!("|{:?}/{}/{}/{}/{}", t.name, t.panels[0].dir.display(), t.panels[1].dir.display(), t.active, t.quick);
+            s += &format!(
+                "|{:?}/{}{}/{}{}/{}/{}",
+                t.name,
+                t.panels[0].dir.display(),
+                t.panels[0].trash,
+                t.panels[1].dir.display(),
+                t.panels[1].trash,
+                t.active,
+                t.quick
+            );
         }
         s
     }
@@ -1251,6 +2014,9 @@ impl App {
         let make = |ps: &crate::config::PanelSave| {
             let dir = if ps.dir.is_dir() { ps.dir.clone() } else { fsx::home() };
             let mut p = Panel::new(dir, hidden);
+            if ps.trash {
+                p.go(Place::Trash);
+            }
             if !ps.cursor.is_empty() {
                 p.select_name(&ps.cursor);
             }
@@ -1267,12 +2033,812 @@ impl App {
                 self.quick = t.quick;
                 slots.push(None);
             } else {
-                slots.push(Some(TabState { panels, active: t.active, quick: t.quick }));
+                slots.push(Some(TabState { panels, active: t.active, quick: t.quick, zoom: false, viewer: false }));
             }
         }
         self.tabs = slots;
         self.tab_names = names;
         self.tab = current;
+    }
+
+    /// `yy` / `yx`: the marked items (or the one under the cursor) into the buffer, copied or cut; the marks go.
+    fn yank(&mut self, cut: bool) {
+        if self.p().is_trash() {
+            return;
+        }
+        // on a remote the buffer holds paths IN it (and which are directories)
+        if let Some((remote, _)) = self.p().remote().map(|(r, p)| (r.to_string(), p.to_string())) {
+            let items = self.remote_items();
+            if items.is_empty() {
+                return;
+            }
+            let n = items.len();
+            let (paths, dirs): (Vec<PathBuf>, Vec<bool>) = items.into_iter().map(|(p, d)| (PathBuf::from(p), d)).unzip();
+            crate::config::save_buffer(&crate::config::Buffer { cut, paths, remote: Some(remote), dirs });
+            self.pm().marked.clear();
+            self.toast(format!("{n} on the remote in the buffer, to {} (pp pastes them)", if cut { "move" } else { "copy" }), false);
+            return;
+        }
+        let paths = self.p().targets();
+        if paths.is_empty() {
+            return;
+        }
+        let n = paths.len();
+        crate::config::save_buffer(&crate::config::Buffer { cut, paths, remote: None, dirs: Vec::new() });
+        self.pm().marked.clear();
+        self.toast(format!("{n} in the buffer, to {}", if cut { "move (pp pastes them)" } else { "copy (pp pastes them)" }), false);
+    }
+
+    /// The marked remote entries of the active panel (or the one under the cursor): (path in the remote, is a directory).
+    fn remote_items(&self) -> Vec<(String, bool)> {
+        let p = self.p();
+        let names: Vec<String> = if p.marked.is_empty() { p.current().filter(|e| !e.is_parent()).map(|e| e.name.clone()).into_iter().collect() } else { p.marked.iter().cloned().collect() };
+        p.entries.iter().filter(|e| names.contains(&e.name)).filter_map(|e| p.remote_path_of(e).map(|rp| (rp, e.is_dir()))).collect()
+    }
+
+    /// The buffer and the directory a paste goes to (`other`: the other panel's), or why not.
+    fn paste_target(&mut self, other: bool) -> Option<(crate::config::Buffer, PathBuf)> {
+        let buf = crate::config::load_buffer();
+        if buf.paths.is_empty() {
+            self.toast("the buffer is empty (yy copies, yx cuts)", true);
+            return None;
+        }
+        if buf.remote.is_some() {
+            self.toast("the buffer holds files of a remote: this paste works on files of this machine (pp, po and pc do both)", true);
+            return None;
+        }
+        let panel = if other { self.other() } else { self.p() };
+        match panel.dir() {
+            Some(d) => Some((buf, d.to_path_buf())),
+            None => {
+                self.toast("not into the trash", true);
+                None
+            }
+        }
+    }
+
+    /// `pp` / `po` / `pc`: the buffer into this (or the other) panel's directory — a local one, or a remote one: between this machine
+    /// and a remote the files go through the plugin (`get` / `put`); a cut buffer moves and is emptied, `as_copy` copies it whatever it
+    /// holds (and keeps it). Remote to another remote has no relay yet (a cut inside one remote is a rename).
+    fn paste(&mut self, other: bool, as_copy: bool) {
+        let buf = crate::config::load_buffer();
+        if buf.paths.is_empty() {
+            self.toast("the buffer is empty (yy copies, yx cuts)", true);
+            return;
+        }
+        let place = if other { self.other().place.clone() } else { self.p().place.clone() };
+        let mv = buf.cut && !as_copy;
+        let kind = if mv { JobKind::Move } else { JobKind::Copy };
+        let label = if buf.paths.len() == 1 { buf.paths[0].file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default() } else { format!("{} items", buf.paths.len()) };
+        let started = match (&buf.remote, place) {
+            (_, Place::Trash) => {
+                self.toast("not into the trash", true);
+                return;
+            }
+            // local files into a local directory: as always
+            (None, Place::Dir(dir)) => {
+                self.start_job(kind, buf.paths.clone(), Some(dir));
+                true
+            }
+            // local files up to a remote directory
+            (None, Place::Remote { remote, path }) => {
+                let steps: Vec<Vec<String>> = buf
+                    .paths
+                    .iter()
+                    .map(|s| {
+                        let name = s.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        vec!["put".to_string(), remote.clone(), crate::panel::remote_join(&path, &name), s.to_string_lossy().into_owned()]
+                    })
+                    .collect();
+                let then = mv.then(|| format!("rm -rf -- {}", buf.paths.iter().map(|s| lvim_fuzzy_plugin_remote::engine::quote(&s.to_string_lossy())).collect::<Vec<_>>().join(" ")));
+                self.remote_job(kind, label, steps, then).is_some()
+            }
+            // remote files down into a local directory
+            (Some(remote), Place::Dir(dir)) => {
+                let mut steps: Vec<Vec<String>> = Vec::new();
+                for (i, p) in buf.paths.iter().enumerate() {
+                    let rp = p.to_string_lossy().into_owned();
+                    let name = rp.trim_end_matches('/').rsplit('/').next().unwrap_or("x").to_string();
+                    steps.push(vec!["get".into(), remote.clone(), rp.clone(), dir.join(&name).to_string_lossy().into_owned()]);
+                    if mv {
+                        let mut rm = vec!["rm".into(), remote.clone(), rp];
+                        if buf.dirs.get(i).copied().unwrap_or(false) {
+                            rm.push("dir".into());
+                        }
+                        steps.push(rm);
+                    }
+                }
+                self.remote_job(kind, label, steps, None).is_some()
+            }
+            // inside one remote: a cut is a rename into the directory
+            (Some(r1), Place::Remote { remote: r2, path }) if *r1 == r2 && mv => {
+                let steps: Vec<Vec<String>> = buf
+                    .paths
+                    .iter()
+                    .map(|p| {
+                        let rp = p.to_string_lossy().into_owned();
+                        let name = rp.trim_end_matches('/').rsplit('/').next().unwrap_or("x").to_string();
+                        vec!["mv".to_string(), r1.clone(), rp, crate::panel::remote_join(&path, &name)]
+                    })
+                    .collect();
+                self.remote_job(kind, label, steps, None).is_some()
+            }
+            // to another remote (or a copy inside one): through a temporary copy on this machine
+            (Some(r1), Place::Remote { remote: r2, path }) => {
+                let items: Vec<(String, bool)> = buf.paths.iter().enumerate().map(|(i, p)| (p.to_string_lossy().into_owned(), buf.dirs.get(i).copied().unwrap_or(false))).collect();
+                self.relay_remote(r1, &items, &r2, &path, mv);
+                true
+            }
+        };
+        if mv && started {
+            crate::config::save_buffer(&crate::config::Buffer::default());
+        }
+    }
+
+    /// `pr`: the paste's target as a field (a rename mask may end it), as for F5 / F3.
+    fn paste_rename(&mut self) {
+        let Some((buf, dir)) = self.paste_target(false) else { return };
+        let what = if buf.paths.len() == 1 {
+            buf.paths[0].file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+        } else {
+            format!("{} items", buf.paths.len())
+        };
+        let title = format!("Paste {what} to");
+        self.input(&title, &fsx::tilde(&dir), InputAction::PasteTo(buf.paths, buf.cut));
+    }
+
+    /// `pl`: symbolic links to the buffer's items in this directory (the links dialog: Tab toggles relative).
+    fn paste_links(&mut self) {
+        let Some((buf, dir)) = self.paste_target(false) else { return };
+        let name = if buf.paths.len() == 1 {
+            buf.paths[0].file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let title = symlink_title(buf.paths.len(), false);
+        self.input(&title, &name, InputAction::Symlink { targets: buf.paths, dir, relative: false });
+    }
+
+    /// `ph`: hard links to the buffer's files in this directory (a directory cannot be hard-linked).
+    fn paste_hard(&mut self) {
+        let Some((buf, dir)) = self.paste_target(false) else { return };
+        let (mut done, mut errs) = (0, Vec::new());
+        for p in &buf.paths {
+            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            match std::fs::hard_link(p, dir.join(&name)) {
+                Ok(()) => done += 1,
+                Err(e) => errs.push(format!("{name}: {e}")),
+            }
+        }
+        for p in &mut self.panels {
+            p.reload();
+        }
+        if errs.is_empty() {
+            self.toast(format!("{done} hard link(s) made"), false);
+        } else {
+            self.dialog = Some(Dialog::Message { title: format!("hard links: {done} made, {} failed", errs.len()), lines: errs });
+        }
+    }
+
+    /// `pm`: the paths in the system clipboard (one a line, or file:// URIs) copied into this directory.
+    fn paste_clipboard(&mut self) {
+        if self.p().is_trash() {
+            return;
+        }
+        let Some(dir) = self.p().dir().map(Path::to_path_buf) else { return };
+        let cmd: Option<(&str, &[&str])> = if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            Some(("wl-paste", &["-n"]))
+        } else if std::env::var_os("DISPLAY").is_some() {
+            Some(("xclip", &["-selection", "clipboard", "-o"]))
+        } else {
+            None
+        };
+        let Some((prog, args)) = cmd else {
+            self.toast("no clipboard tool (wl-paste / xclip) for this session", true);
+            return;
+        };
+        let text = std::process::Command::new(prog).args(args).output().ok().filter(|o| o.status.success());
+        let paths: Vec<PathBuf> = text
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+            .lines()
+            .map(|l| l.trim().strip_prefix("file://").unwrap_or(l.trim()).to_string())
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute() && p.symlink_metadata().is_ok())
+            .collect();
+        if paths.is_empty() {
+            self.toast("no existing paths in the clipboard", true);
+            return;
+        }
+        self.start_job(JobKind::Copy, paths, Some(dir));
+    }
+
+    /// `pv`: what is waiting in the buffer.
+    fn buffer_view(&mut self) {
+        let buf = crate::config::load_buffer();
+        if buf.paths.is_empty() {
+            self.toast("the buffer is empty (yy copies, yx cuts)", false);
+            return;
+        }
+        let title = format!("Buffer: {} item(s) to {}{}", buf.paths.len(), if buf.cut { "move" } else { "copy" }, buf.remote.as_ref().map(|r| format!(" — on {r}")).unwrap_or_default());
+        let lines = buf.paths.iter().map(|p| if buf.remote.is_some() { p.to_string_lossy().into_owned() } else { fsx::tilde(p) }).collect();
+        self.dialog = Some(Dialog::Message { title, lines });
+    }
+
+    /// `vd`: compare the two panels' directories by name, size and time: in each panel the entries that the other
+    /// has not, or has different (a file's size or modification time), are marked — copy them with `oc`.
+    fn compare_panels(&mut self) {
+        use std::collections::HashMap;
+        if self.panels.iter().any(Panel::is_trash) {
+            self.toast("not in the trash", true);
+            return;
+        }
+        let facts = |p: &Panel| -> HashMap<String, (bool, u64, i64)> {
+            p.entries.iter().filter(|e| !e.is_parent()).map(|e| (e.name.clone(), (e.is_dir(), e.size, e.mtime))).collect()
+        };
+        let (a, b) = (facts(&self.panels[0]), facts(&self.panels[1]));
+        let differs = |x: &(bool, u64, i64), y: Option<&(bool, u64, i64)>| match y {
+            None => true,
+            Some(y) => x.0 != y.0 || (!x.0 && (x.1 != y.1 || x.2 != y.2)),
+        };
+        let mut counts = [0usize; 2];
+        for (i, (mine, other)) in [(&a, &b), (&b, &a)].into_iter().enumerate() {
+            let marks: std::collections::BTreeSet<String> =
+                mine.iter().filter(|(n, f)| differs(f, other.get(*n))).map(|(n, _)| n.clone()).collect();
+            counts[i] = marks.len();
+            self.panels[i].marked = marks;
+        }
+        self.toast(format!("{} differ in the left panel, {} in the right (marked)", counts[0], counts[1]), false);
+    }
+
+    /// The client of the remote plugin (the plugin is written into the shared directory first, as the others are).
+    fn remote_client(&mut self) -> &mut lvim_fuzzy_plugin::Remote {
+        if self.remote.is_none() {
+            lvim_fuzzy_plugin_remote::ensure_installed(&crate::config::plugins_dir());
+            let r = lvim_fuzzy_plugin::Remote::load(&crate::config::plugin_roots(), "lvim-fuzzy-commander", &self.cfg.plugins, self.wake_tx.clone());
+            let cache_mb = r.config()["cache"].as_u64().unwrap_or(512);
+            std::thread::spawn(move || lvim_fuzzy_plugin_remote::engine::prune_cache(cache_mb));
+            self.remote = Some(r);
+        }
+        self.remote.as_mut().expect("just made")
+    }
+
+    /// A panel that shows a remote directory asks the plugin for it (`reload` only says it wants it).
+    fn remote_sync(&mut self) {
+        for i in 0..2 {
+            if !self.panels[i].remote_want {
+                continue;
+            }
+            self.panels[i].remote_want = false;
+            let Some((remote, path)) = self.panels[i].remote().map(|(r, p)| (r.to_string(), p.to_string())) else { continue };
+            let mut ctx = serde_json::json!({"remote": remote, "path": path});
+            if let Some(site) = self.remote_site(&remote) {
+                ctx["site"] = site;
+            }
+            match self.remote_client().call("list", ctx) {
+                Ok(tag) => {
+                    self.panels[i].remote_tag = Some(tag);
+                    self.remote_tasks.insert(tag, RemoteTask::List);
+                }
+                Err(e) => self.panels[i].set_remote_error(e),
+            }
+        }
+    }
+
+    /// The answers of the remote plugin: a directory listed, the remotes known.
+    fn pump_remote(&mut self) {
+        let Some(r) = self.remote.as_mut() else { return };
+        for (tag, result) in r.poll() {
+            match self.remote_tasks.remove(&tag) {
+                Some(RemoteTask::List) => {
+                    let Some(i) = (0..2).find(|&i| self.panels[i].remote_tag == Some(tag)) else { continue };
+                    self.panels[i].remote_tag = None;
+                    match result {
+                        Ok(v) => {
+                            // the engine may say which directory it really listed (`~` is the home on sftp): that is the path now
+                            if let Some(real) = v["path"].as_str()
+                                && let Place::Remote { remote, .. } = self.panels[i].place.clone()
+                            {
+                                self.panels[i].place = Place::Remote { remote, path: real.to_string() };
+                            }
+                            self.panels[i].set_remote_entries(lvim_fuzzy_plugin::remote::entries(&v));
+                        }
+                        Err(e) => {
+                            // a login that was refused: the password is asked for (once per attempt), then it is tried
+                            let remote = self.panels[i].remote().map(|(r, _)| r.to_string()).unwrap_or_default();
+                            let login = e.contains("authentication failed") || e.contains("login as");
+                            self.panels[i].set_remote_error(e.clone());
+                            if login && !self.session_pw.contains_key(&remote) && self.dialog.is_none() {
+                                self.dialog = Some(Dialog::Input { title: format!("Password for {remote}"), value: String::new(), cur: 0, action: InputAction::RemotePassword { remote } });
+                            } else {
+                                self.toast(format!("remote: {e}"), true);
+                            }
+                        }
+                    }
+                }
+                Some(RemoteTask::Users { remote, paths, owner }) => match result {
+                    Ok(v) => self.owner_dialog_remote(remote, paths, owner, &v),
+                    Err(e) => self.toast(format!("the users of the remote machine: {e}"), true),
+                },
+                Some(RemoteTask::Disconnect(name)) => match result {
+                    Ok(_) => self.toast(format!("disconnected from {name}"), false),
+                    Err(e) => self.toast(format!("disconnected from {name} (the plugin said: {e})"), true),
+                },
+                Some(RemoteTask::Names(for_what)) => match result {
+                    Ok(v) => self.remote_menu(lvim_fuzzy_plugin::remote::remote_names(&v), for_what),
+                    Err(e) => self.toast(format!("remote: {e}"), true),
+                },
+                None => {}
+            }
+        }
+    }
+
+    /// The owner dialog of remote paths, made of the remote machine's own real users and groups.
+    fn owner_dialog_remote(&mut self, remote: String, paths: Vec<String>, owner: (u32, u32), answer: &serde_json::Value) {
+        let mut ids = RemoteIds { remote, ..Default::default() };
+        let mut users: Vec<String> = Vec::new();
+        let mut groups: Vec<String> = Vec::new();
+        for u in answer["users"].as_array().into_iter().flatten() {
+            let (Some(n), Some(uid)) = (u["name"].as_str(), u["uid"].as_u64()) else { continue };
+            ids.users.push((n.to_string(), uid as u32, u["gid"].as_u64().unwrap_or(0) as u32));
+            if u["real"].as_bool().unwrap_or(false) {
+                users.push(n.to_string());
+            }
+        }
+        for g in answer["groups"].as_array().into_iter().flatten() {
+            let (Some(n), Some(gid)) = (g["name"].as_str(), g["gid"].as_u64()) else { continue };
+            let members: Vec<String> = g["members"].as_array().into_iter().flatten().filter_map(|m| m.as_str().map(str::to_string)).collect();
+            ids.groups.push((n.to_string(), gid as u32, members));
+            if g["real"].as_bool().unwrap_or(false) {
+                groups.push(n.to_string());
+            }
+        }
+        // the entry's own owner, by the remote's names, is always there (a service account owning the file, say)
+        let cu = ids.users.iter().find(|(_, uid, _)| *uid == owner.0).map(|(n, _, _)| n.clone()).unwrap_or_else(|| owner.0.to_string());
+        let cg = ids.groups.iter().find(|(_, gid, _)| *gid == owner.1).map(|(n, _, _)| n.clone()).unwrap_or_else(|| owner.1.to_string());
+        if !users.contains(&cu) {
+            users.insert(0, cu.clone());
+        }
+        if !groups.contains(&cg) {
+            groups.insert(0, cg.clone());
+        }
+        if users.is_empty() || groups.is_empty() {
+            self.toast("the remote machine has no users or groups to choose from", true);
+            return;
+        }
+        let user = users.iter().position(|u| u == &cu).unwrap_or(0);
+        let group = groups.iter().position(|g| g == &cg).unwrap_or(0);
+        let members = ids.members(&groups[group]);
+        self.dialog = Some(Dialog::Owner { paths: paths.into_iter().map(PathBuf::from).collect(), users, groups, user, group, members, remote: Some(ids), focus: 0, open: None });
+    }
+
+    /// `rl` / `re` / `rd`: ask which remotes there are; the menu comes when the answer does.
+    fn remote_connect(&mut self, for_what: NamesFor) {
+        match self.remote_client().call("remotes", serde_json::json!({})) {
+            Ok(tag) => {
+                self.remote_tasks.insert(tag, RemoteTask::Names(for_what));
+            }
+            Err(e) => self.toast(format!("remote: {e}"), true),
+        }
+    }
+
+    fn remote_menu(&mut self, names: Vec<lvim_fuzzy_plugin::RemoteName>, for_what: NamesFor) {
+        if names.is_empty() {
+            self.dialog = Some(Dialog::Message {
+                title: "No remote connections".into(),
+                lines: vec![
+                    "`r a` makes one here (SFTP, FTP, an rclone remote, a mount).".into(),
+                    "The remotes of `rclone config` are listed too.".into(),
+                ],
+            });
+            return;
+        }
+        if for_what == NamesFor::Open {
+            let rows = names
+                .into_iter()
+                .map(|n| {
+                    // a start path of its own, else: an rclone remote starts at its top, sftp at the home directory, the rest at /
+                    let start = n.path.clone().unwrap_or_else(|| match n.engine.as_str() {
+                        "rclone" => String::new(),
+                        "sftp" => "~".to_string(),
+                        _ => "/".to_string(),
+                    });
+                    ConnRow { name: n.name, engine: n.engine, detail: n.detail, start }
+                })
+                .collect();
+            self.dialog = Some(Dialog::Connections { rows, sel: 0 });
+            return;
+        }
+        let items = names
+            .into_iter()
+            .map(|n| {
+                let label = format!("{:<16} {:<7} {}", n.name, n.engine, n.detail);
+                let item = match for_what {
+                    NamesFor::Edit => MenuItem::RemoteEdit(n.name),
+                    _ => MenuItem::RemoteDelete(n.name),
+                };
+                (label.trim_end().to_string(), item)
+            })
+            .collect();
+        let title = if for_what == NamesFor::Edit { "Change a connection" } else { "Delete a connection" };
+        self.dialog = Some(Dialog::Menu { title: title.into(), items, sel: 0 });
+    }
+
+    /// Is a panel (of any tab) on this remote? That is what "connected" means in the list.
+    fn remote_connected(&self, name: &str) -> bool {
+        let on = |p: &Panel| p.remote().is_some_and(|(r, _)| r == name);
+        self.panels.iter().any(on) || self.tabs.iter().flatten().any(|t| t.panels.iter().any(on))
+    }
+
+    /// Disconnect: every panel on the remote goes back to its last directory on this machine, the plugin closes the connection (and
+    /// unmounts what it mounted), and the password typed for it is forgotten.
+    fn remote_disconnect(&mut self, name: &str) {
+        for p in &mut self.panels {
+            if p.remote().is_some_and(|(r, _)| r == name) {
+                p.leave_remote();
+            }
+        }
+        for t in self.tabs.iter_mut().flatten() {
+            for p in &mut t.panels {
+                if p.remote().is_some_and(|(r, _)| r == name) {
+                    p.leave_remote();
+                }
+            }
+        }
+        self.session_pw.remove(name);
+        match self.remote_client().call("disconnect", serde_json::json!({"remote": name, "path": "/"})) {
+            Ok(tag) => {
+                self.remote_tasks.insert(tag, RemoteTask::Disconnect(name.to_string()));
+            }
+            Err(e) => self.toast(format!("remote: {e}"), true),
+        }
+    }
+
+    /// The directory where the shared settings of the remote plugin live (the connections made here are written into it).
+    fn sites_root(&self) -> PathBuf {
+        crate::config::plugin_roots().into_iter().next().unwrap_or_else(crate::config::plugins_dir)
+    }
+
+    /// `ra` (a new connection) and `re` (this one): the form.
+    fn site_form(&mut self, name: Option<String>) {
+        let mut vals = std::collections::BTreeMap::new();
+        let mut ty = 0;
+        if let Some(n) = &name {
+            match lvim_fuzzy_plugin_remote::sites::load(&self.sites_root(), n) {
+                Some(m) => {
+                    let get = |k: &str| m.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let (engine, via) = (get("engine"), get("via"));
+                    ty = SITE_TYPES.iter().position(|(_, e, v)| *e == engine && (*v == via || (v.is_empty() && !["sshfs", "rclone"].contains(&via.as_str())))).unwrap_or(0);
+                    for (k, v) in m {
+                        let t = match v {
+                            serde_json::Value::String(s) => s,
+                            other => other.to_string(),
+                        };
+                        vals.insert(k, t);
+                    }
+                }
+                None => {
+                    self.toast(format!("{n} is not in the settings file of the plugin (it comes from rclone or from a config): change it there"), true);
+                    return;
+                }
+            }
+        }
+        let sugg = Suggest { hosts: lvim_fuzzy_plugin_remote::sites::ssh_hosts(), keys: lvim_fuzzy_plugin_remote::sites::ssh_keys(), remotes: lvim_fuzzy_plugin_remote::engine::rclone_remotes() };
+        self.dialog = Some(Dialog::Site { locked: name.is_some(), name: name.unwrap_or_default(), ty, vals, focus: 0, open: None, sugg, note: String::new() });
+    }
+
+    /// OK in the form: check, write the connection into the settings file, and let the plugin read it again.
+    fn site_save(&mut self, name: &str, locked: bool, ty: usize, vals: &std::collections::BTreeMap<String, String>) -> Result<(), String> {
+        let root = self.sites_root();
+        if !lvim_fuzzy_plugin_remote::sites::valid_name(name) {
+            return Err("give it a name: letters, digits, - _ . @".into());
+        }
+        if !locked && lvim_fuzzy_plugin_remote::sites::load(&root, name).is_some() {
+            return Err(format!("`{name}` is a connection already (change it with `r e`)"));
+        }
+        let (_, engine, via) = SITE_TYPES[ty];
+        let mut m = serde_json::Map::new();
+        m.insert("engine".into(), engine.into());
+        if !via.is_empty() {
+            m.insert("via".into(), via.into());
+        }
+        for f in site_fields(ty) {
+            let v = vals.get(f.key).map(|s| s.trim()).unwrap_or("");
+            if v.is_empty() {
+                continue;
+            }
+            if f.key == "port" {
+                let p: i64 = v.parse().map_err(|_| "the port is a number".to_string())?;
+                m.insert(f.key.into(), p.into());
+            } else {
+                m.insert(f.key.to_string(), v.into());
+            }
+        }
+        let need = match (engine, via) {
+            ("sftp", _) | ("ftp", _) | ("mount", "sshfs") => Some(("host", "the server")),
+            ("rclone", _) | ("mount", "rclone") => Some(("remote", "the remote")),
+            _ => None,
+        };
+        if let Some((k, what)) = need
+            && !m.contains_key(k)
+        {
+            return Err(format!("{what} is needed"));
+        }
+        if engine == "mount" && via.is_empty() && !m.contains_key("mount") && !m.contains_key("root") {
+            return Err("a mount command, or the folder it is mounted on, is needed".into());
+        }
+        lvim_fuzzy_plugin_remote::sites::save(&root, name, &m)?;
+        self.remote_reset();
+        Ok(())
+    }
+
+    /// The plugin reads its settings again (after a connection was made, changed or deleted).
+    fn remote_reset(&mut self) {
+        if let Some(mut r) = self.remote.take() {
+            r.stop();
+        }
+        self.remote_tasks.clear();
+    }
+
+    /// The connection's entry of the settings with the password typed this session in it (for a call or a transfer).
+    fn remote_site(&mut self, name: &str) -> Option<serde_json::Value> {
+        let pw = self.session_pw.get(name).cloned()?;
+        let mut site = self.remote_client().config()["remotes"][name].clone();
+        if !site.is_object() {
+            site = serde_json::json!({});
+        }
+        site["password"] = pw.into();
+        Some(site)
+    }
+
+    /// The shell line (`xfer` verbs chained) as a job, its progress read from what it prints.
+    fn remote_job(&mut self, kind: JobKind, label: String, steps: Vec<Vec<String>>, then: Option<String>) -> Option<u32> {
+        let Ok(exe) = std::env::current_exe() else {
+            self.toast("cannot find this program", true);
+            return None;
+        };
+        let mut cfg = self.remote_client().config();
+        for (name, pw) in &self.session_pw {
+            if !cfg["remotes"][name].is_object() {
+                cfg["remotes"][name] = serde_json::json!({});
+            }
+            cfg["remotes"][name]["password"] = pw.clone().into();
+        }
+        let mut line = lvim_fuzzy_plugin_remote::xfer_line(&exe, &steps, &cfg);
+        if let Some(t) = then {
+            line.push_str(" && ");
+            line.push_str(&t);
+        }
+        let job = wake_on(ops::start_remote(kind, line, label), self.wake_tx.clone());
+        Some(self.add_job(job))
+    }
+
+    /// Copy or move between a remote panel and a local one: the files go through the plugin's `get` / `put`; a move removes
+    /// the source after the copy went well. Between two remotes there is no relay yet.
+    fn remote_copy_move(&mut self, mv: bool) {
+        let (src_remote, dst_remote) = (self.p().remote().is_some(), self.other().remote().is_some());
+        if src_remote && dst_remote {
+            let items = self.remote_items();
+            if items.is_empty() {
+                return;
+            }
+            let (Some((r1, _)), Some((r2, d2))) = (self.p().remote().map(|(r, p)| (r.to_string(), p.to_string())), self.other().remote().map(|(r, p)| (r.to_string(), p.to_string()))) else { return };
+            self.relay_remote(&r1, &items, &r2, &d2, mv);
+            return;
+        }
+        let kind = if mv { JobKind::Move } else { JobKind::Copy };
+        if src_remote {
+            let Some(dest) = self.other().dir().map(Path::to_path_buf) else {
+                self.toast("the other panel is not a directory", true);
+                return;
+            };
+            let Some((remote, _)) = self.p().remote().map(|(r, p)| (r.to_string(), p.to_string())) else { return };
+            let items: Vec<(String, bool)> = {
+                let p = self.p();
+                let names: Vec<String> = if p.marked.is_empty() { p.current().filter(|e| !e.is_parent()).map(|e| e.name.clone()).into_iter().collect() } else { p.marked.iter().cloned().collect() };
+                p.entries.iter().filter(|e| names.contains(&e.name)).filter_map(|e| p.remote_path_of(e).map(|rp| (rp, e.is_dir()))).collect()
+            };
+            if items.is_empty() {
+                return;
+            }
+            let mut steps: Vec<Vec<String>> = Vec::new();
+            for (path, dir) in &items {
+                let name = path.trim_end_matches('/').rsplit('/').next().unwrap_or("x");
+                steps.push(vec!["get".into(), remote.clone(), path.clone(), dest.join(name).to_string_lossy().into_owned()]);
+                if mv {
+                    let mut rm = vec!["rm".into(), remote.clone(), path.clone()];
+                    if *dir {
+                        rm.push("dir".into());
+                    }
+                    steps.push(rm);
+                }
+            }
+            let label = if items.len() == 1 { items[0].0.rsplit('/').next().unwrap_or("").to_string() } else { format!("{} items", items.len()) };
+            self.remote_job(kind, label, steps, None);
+        } else {
+            let Some((remote, dir)) = self.other().remote().map(|(r, p)| (r.to_string(), p.to_string())) else { return };
+            let src = self.p().targets();
+            if src.is_empty() {
+                return;
+            }
+            let mut steps: Vec<Vec<String>> = Vec::new();
+            for s in &src {
+                let name = s.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                steps.push(vec!["put".into(), remote.clone(), crate::panel::remote_join(&dir, &name), s.to_string_lossy().into_owned()]);
+            }
+            let then = mv.then(|| format!("rm -rf -- {}", src.iter().map(|s| lvim_fuzzy_plugin_remote::engine::quote(&s.to_string_lossy())).collect::<Vec<_>>().join(" ")));
+            let label = if src.len() == 1 { src[0].file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default() } else { format!("{} items", src.len()) };
+            self.remote_job(kind, label, steps, then);
+        }
+    }
+
+
+    /// Copy or move remote files to another remote (or into another directory of the same one) through a temporary copy on this machine:
+    /// each is downloaded, uploaded, and the temporary copy removed; a move removes the source when both went well.
+    fn relay_remote(&mut self, src_remote: &str, items: &[(String, bool)], dst_remote: &str, dst_dir: &str, mv: bool) {
+        let tmp = lvim_fuzzy_plugin_remote::engine::cache_dir().join("files").join(format!("relay-{}-{}", std::process::id(), self.next_job));
+        let mut steps: Vec<Vec<String>> = Vec::new();
+        for (path, dir) in items {
+            let name = path.trim_end_matches('/').rsplit('/').next().unwrap_or("x").to_string();
+            let local = tmp.join(&name).to_string_lossy().into_owned();
+            steps.push(vec!["get".into(), src_remote.to_string(), path.clone(), local.clone()]);
+            steps.push(vec!["put".into(), dst_remote.to_string(), crate::panel::remote_join(dst_dir, &name), local]);
+            if mv {
+                let mut rm = vec!["rm".into(), src_remote.to_string(), path.clone()];
+                if *dir {
+                    rm.push("dir".into());
+                }
+                steps.push(rm);
+            }
+        }
+        let label = if items.len() == 1 { items[0].0.rsplit('/').next().unwrap_or("").to_string() } else { format!("{} items", items.len()) };
+        let cleanup = format!("rm -rf -- {}", lvim_fuzzy_plugin_remote::engine::quote(&tmp.to_string_lossy()));
+        // the temporary copy goes when it all went well (one left by a failure is under the cache's limit, which prunes it)
+        self.remote_job(if mv { JobKind::Move } else { JobKind::Copy }, label, steps, Some(cleanup));
+    }
+
+    /// Delete on a remote panel: asks, then removes through the plugin (a remote has no trash).
+    fn remote_delete(&mut self) {
+        let Some((remote, _)) = self.p().remote().map(|(r, p)| (r.to_string(), p.to_string())) else { return };
+        let p = self.p();
+        let names: Vec<String> = if p.marked.is_empty() { p.current().filter(|e| !e.is_parent()).map(|e| e.name.clone()).into_iter().collect() } else { p.marked.iter().cloned().collect() };
+        let items: Vec<(String, bool)> = p.entries.iter().filter(|e| names.contains(&e.name)).filter_map(|e| p.remote_path_of(e).map(|rp| (rp, e.is_dir()))).collect();
+        if items.is_empty() {
+            return;
+        }
+        let what = if items.len() == 1 { items[0].0.clone() } else { format!("{} items", items.len()) };
+        self.dialog = Some(Dialog::Confirm {
+            title: "Delete from the remote".into(),
+            lines: vec![format!("Delete {what} on {remote} for good? There is no trash there.")],
+            action: ConfirmAction::RemoteRm { remote, items },
+        });
+    }
+
+    /// `:` / `ax`: the command line over the button bar; Enter types the command into the shell and shows it.
+    fn command_line(&mut self) {
+        self.hist_at = self.shell_history.len();
+        self.comp = None;
+        self.dialog = Some(Dialog::Input { title: String::new(), value: String::new(), cur: 0, action: InputAction::Shell });
+    }
+
+    /// `Ctrl-o` / `as`: show the shell under the panels (started in this directory the first time); Ctrl-o in it
+    /// comes back, to the directory the shell is in then. The shell lives on between visits.
+    fn subshell(&mut self, term: &mut Term) -> std::io::Result<()> {
+        if self.subshell.is_none() {
+            let dir = self.p().dir().map(Path::to_path_buf).unwrap_or_else(fsx::home);
+            match crate::subshell::Subshell::start(&dir) {
+                Ok(s) => self.subshell = Some(s),
+                Err(e) => {
+                    self.toast(format!("the shell did not start: {e}"), true);
+                    return Ok(());
+                }
+            }
+        }
+        term.suspend()?;
+        crossterm::terminal::enable_raw_mode()?;
+        let left = self.subshell.as_mut().map(|s| s.attach());
+        let cwd = self.subshell.as_ref().and_then(|s| s.cwd());
+        term.resume()?;
+        match left {
+            Some(Ok(crate::subshell::Left::Detached)) => {}
+            Some(Ok(crate::subshell::Left::Exited)) => {
+                self.subshell = None;
+                self.toast("the shell ended", false);
+            }
+            Some(Err(e)) => {
+                self.subshell = None;
+                self.toast(format!("the shell: {e}"), true);
+            }
+            None => {}
+        }
+        // the panel follows the shell
+        if let Some(d) = cwd.filter(|d| d.is_dir())
+            && self.subshell.is_some()
+            && !self.p().is_trash()
+            && self.p().dir() != Some(d.as_path())
+        {
+            self.pm().go(Place::Dir(d));
+        }
+        for p in &mut self.panels {
+            p.reload();
+        }
+        Ok(())
+    }
+
+    /// `vi`: what is known about the file under the cursor (the spotter): path, kind, type, size, mode, owner,
+    /// the three times, the link's target — each in the colour the listing uses for it.
+    fn info(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+        let Some(path) = self.p().current_path() else { return };
+        let Ok(md) = std::fs::symlink_metadata(&path) else {
+            self.toast("no such file any more", true);
+            return;
+        };
+        let secs = |t: std::io::Result<std::time::SystemTime>| t.ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64);
+        let when = |t: std::io::Result<std::time::SystemTime>| match secs(t) {
+            Some(t) => vec![(fsx::date_string(t), age_colour(t))],
+            None => vec![("—".to_string(), "comment")],
+        };
+        let ft = md.file_type();
+        let (kind, kind_colour, kc) = if ft.is_symlink() {
+            ("symbolic link", "cyan", 'l')
+        } else if md.is_dir() {
+            ("directory", "blue", 'd')
+        } else if md.is_file() {
+            ("file", "green", '-')
+        } else {
+            ("special file", "magenta", 'c')
+        };
+        let m = md.mode();
+        let mut sym = String::from(kc);
+        for (i, c) in "rwxrwxrwx".chars().enumerate() {
+            let bit = 0o400 >> i;
+            let mut ch = if m & bit != 0 { c } else { '-' };
+            if i == 2 && m & 0o4000 != 0 {
+                ch = if m & 0o100 != 0 { 's' } else { 'S' };
+            }
+            if i == 5 && m & 0o2000 != 0 {
+                ch = if m & 0o010 != 0 { 's' } else { 'S' };
+            }
+            if i == 8 && m & 0o1000 != 0 {
+                ch = if m & 0o001 != 0 { 't' } else { 'T' };
+            }
+            sym.push(ch);
+        }
+        let dir = path.parent().map(|p| format!("{}/", fsx::tilde(p).trim_end_matches('/'))).unwrap_or_default();
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "/".into());
+        let mut rows = vec![
+            InfoRow { label: "path", value: vec![(dir, "teal"), (name, "yellow")] },
+            InfoRow { label: "kind", value: vec![(kind.to_string(), kind_colour)] },
+        ];
+        if let Ok(t) = std::fs::read_link(&path) {
+            rows.push(InfoRow { label: "target", value: vec![(t.display().to_string(), "cyan")] });
+        }
+        if md.is_file()
+            && let Ok(o) = std::process::Command::new("file").arg("-b").arg("--mime-type").arg(&path).output()
+            && o.status.success()
+        {
+            rows.push(InfoRow { label: "type", value: vec![(String::from_utf8_lossy(&o.stdout).trim().to_string(), "purple")] });
+        }
+        rows.push(InfoRow { label: "size", value: vec![(fsx::human_size(md.len()), "cyan"), (format!("  ({} bytes)", md.len()), "comment")] });
+        rows.push(InfoRow { label: "mode", value: vec![(sym, "mode"), (format!("  {:o}", m & 0o7777), "comment")] });
+        rows.push(InfoRow {
+            label: "owner",
+            value: vec![
+                (fsx::user_name(md.uid()), if md.uid() == 0 { "red" } else { "orange" }),
+                (":".into(), "comment"),
+                (fsx::group_name(md.gid()), "teal"),
+                (format!("  ({}:{})", md.uid(), md.gid()), "comment"),
+            ],
+        });
+        rows.push(InfoRow { label: "modified", value: when(md.modified()) });
+        rows.push(InfoRow { label: "accessed", value: when(md.accessed()) });
+        rows.push(InfoRow { label: "created", value: when(md.created()) });
+        rows.push(InfoRow {
+            label: "inode",
+            value: vec![(md.ino().to_string(), "cyan"), ("  links ".into(), "magenta"), (md.nlink().to_string(), "orange")],
+        });
+        self.dialog = Some(Dialog::Info { title: "Info".into(), rows });
     }
 
     /// Ctrl-c l: permissions, owner and group together on / off (the "long" listing).
@@ -1317,6 +2883,14 @@ impl App {
         if self.p().is_trash() {
             return;
         }
+        if let Some((remote, dir)) = self.p().remote().map(|(r, p)| (r.to_string(), p.to_string())) {
+            // a link in this remote directory to the entry under the cursor
+            let Some(e) = self.p().current().cloned().filter(|e| !e.is_parent()) else { return };
+            let Some(target) = self.p().remote_path_of(&e) else { return };
+            let name = format!("{}-link", e.name);
+            self.input("A symbolic link here to this — its name", &name, InputAction::RemoteLink { remote, dir, target });
+            return;
+        }
         let targets = self.p().targets();
         let Some(dir) = self.other().dir().map(Path::to_path_buf) else {
             return;
@@ -1343,6 +2917,9 @@ impl App {
             panels: std::mem::replace(&mut self.panels, t.panels),
             active: std::mem::replace(&mut self.active, t.active),
             quick: std::mem::replace(&mut self.quick, t.quick),
+            // zoom and the viewer belong to the tab they were turned on in
+            zoom: std::mem::replace(&mut self.zoom, t.zoom),
+            viewer: std::mem::replace(&mut self.viewer, t.viewer),
         };
         self.tabs[self.tab] = Some(old);
         self.tab = i;
@@ -1360,6 +2937,8 @@ impl App {
             panels: [Panel::new(dir(&self.panels[0]), hidden), Panel::new(dir(&self.panels[1]), hidden)],
             active: self.active,
             quick: self.quick,
+            zoom: false,
+            viewer: false,
         };
         self.tabs.insert(self.tab + 1, Some(t));
         self.tab_names.insert(self.tab + 1, None);
@@ -1408,17 +2987,28 @@ impl App {
         self.input("Rename the tab (empty: the directory's name)", &now, InputAction::TabName);
     }
 
-    /// Ctrl-c < / >: move this tab one place left / right (the other tab changes places with it).
+    /// Ctrl-c < / >: move this tab one place left / right; past the end it wraps round (the first goes last).
     fn move_tab(&mut self, d: isize) {
-        let to = self.tab as isize + d;
-        if to < 0 || to >= self.tabs.len() as isize {
+        let n = self.tabs.len();
+        if n < 2 {
+            self.toast("there is only one tab (Ctrl-c n opens another)".to_string(), false);
             return;
         }
-        let to = to as usize;
-        // the current tab lives in `panels` and its slot holds None: the slots swap, the tab number follows
-        self.tabs.swap(self.tab, to);
-        self.tab_names.swap(self.tab, to);
-        self.tab = to;
+        // the current tab lives in `panels` and its slot holds None: the slots move, the tab number follows
+        if d < 0 && self.tab == 0 {
+            self.tabs.rotate_left(1);
+            self.tab_names.rotate_left(1);
+            self.tab = n - 1;
+        } else if d > 0 && self.tab == n - 1 {
+            self.tabs.rotate_right(1);
+            self.tab_names.rotate_right(1);
+            self.tab = 0;
+        } else {
+            let to = (self.tab as isize + d) as usize;
+            self.tabs.swap(self.tab, to);
+            self.tab_names.swap(self.tab, to);
+            self.tab = to;
+        }
     }
 
     /// F2: the quick view on / off; remembered for the next run.
@@ -1430,10 +3020,10 @@ impl App {
 
     /// J / K on a media preview with positions (PDF / document pages, a video's points): move among them.
     fn seek(&mut self, d: i32) -> bool {
-        if !self.quick {
+        if !self.quick && !self.viewer {
             return false;
         }
-        let Some(path) = self.p().current_path() else { return false };
+        let Some(path) = self.pcur() else { return false };
         let positions = match self.plug_answers.get(&(path, self.plug_skip)) {
             Some(lvim_fuzzy_ui::provided::Answer::Preview(p)) => p.positions,
             _ => 1,
@@ -1452,10 +3042,10 @@ impl App {
     /// Scroll the quick view: `n` lines, or (half) a half page in the direction of `n`. A Neovim preview
     /// gets the keys (as lfz does), the built-in one moves its offset.
     fn scroll_preview(&mut self, n: isize, half: bool) {
-        if !self.quick {
+        if !self.quick && !self.viewer {
             return;
         }
-        let cur = self.p().current_path().map(|p| p.to_string_lossy().into_owned());
+        let cur = self.pcur().map(|p| p.to_string_lossy().into_owned());
         if let Some(nv) = &self.nvim {
             let shown = nv.grid.lock().unwrap().shown.clone();
             if shown.is_some() && shown == cur && cur.as_deref().is_some_and(|c| Path::new(c).is_file()) {
@@ -1475,7 +3065,7 @@ impl App {
 
     /// A different entry under the cursor: the preview starts at its top.
     fn pv_follow(&mut self) {
-        let cur = self.p().current_path().map(|p| p.to_string_lossy().into_owned());
+        let cur = self.pcur().map(|p| p.to_string_lossy().into_owned());
         if cur != self.pv_path {
             self.pv_off = 0;
             // another file: its first page / point, its picture waits a moment
@@ -1499,7 +3089,167 @@ impl App {
             return Ok(());
         };
         match d {
-            Dialog::Message { .. } => {} // any key closes it
+            Dialog::Message { .. } | Dialog::Info { .. } => {} // any key closes it
+            Dialog::Connections { rows, mut sel } => {
+                match k.code {
+                    KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
+                    KeyCode::Up | KeyCode::Char('k') => sel = sel.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Char('j') => sel = (sel + 1).min(rows.len().saturating_sub(1)),
+                    KeyCode::Enter => {
+                        if let Some(r) = rows.get(sel).cloned() {
+                            if self.remote_connected(&r.name) {
+                                // the button of a connected one is Disconnect: the list stays, now saying so
+                                self.remote_disconnect(&r.name);
+                            } else {
+                                self.pm().go(Place::Remote { remote: r.name, path: r.start });
+                                return Ok(());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                self.dialog = Some(Dialog::Connections { rows, sel });
+            }
+            Dialog::Site { mut name, locked, mut ty, mut vals, mut focus, mut open, sugg, mut note } => {
+                note.clear();
+                let fields = site_fields(ty);
+                let rows = 2 + fields.len() + 2;
+                let (ok, cancel) = (2 + fields.len(), 3 + fields.len());
+                let mut keep = true;
+                if let Some(mut list) = open.take() {
+                    // a drop-down is open: ↑ ↓ move, typing filters, Enter picks, Esc closes it
+                    let m = list.matches();
+                    match k.code {
+                        KeyCode::Esc => {}
+                        KeyCode::Enter => {
+                            if let Some(&i) = m.get(list.sel) {
+                                if focus == 1 {
+                                    ty = i;
+                                } else if let Some(f) = fields.get(focus.wrapping_sub(2)) {
+                                    vals.insert(f.key.to_string(), list.items[i].1.clone());
+                                }
+                            }
+                        }
+                        KeyCode::Down | KeyCode::Tab => {
+                            list.sel = (list.sel + 1).min(m.len().saturating_sub(1));
+                            open = Some(list);
+                        }
+                        KeyCode::Char('n') if ctrl => {
+                            list.sel = (list.sel + 1).min(m.len().saturating_sub(1));
+                            open = Some(list);
+                        }
+                        KeyCode::Up | KeyCode::BackTab => {
+                            list.sel = list.sel.saturating_sub(1);
+                            open = Some(list);
+                        }
+                        KeyCode::Char('p') if ctrl => {
+                            list.sel = list.sel.saturating_sub(1);
+                            open = Some(list);
+                        }
+                        KeyCode::Backspace => {
+                            list.query.pop();
+                            list.sel = 0;
+                            open = Some(list);
+                        }
+                        KeyCode::Char(c) if !ctrl => {
+                            list.query.push(c);
+                            list.sel = 0;
+                            open = Some(list);
+                        }
+                        _ => open = Some(list),
+                    }
+                } else {
+                    match k.code {
+                        KeyCode::Esc => keep = false,
+                        KeyCode::Tab | KeyCode::Down => focus = (focus + 1) % rows,
+                        KeyCode::BackTab | KeyCode::Up => focus = (focus + rows - 1) % rows,
+                        // the kind: ← → go round, Enter opens the list of all of them
+                        KeyCode::Left | KeyCode::Right if focus == 1 => {
+                            let n = SITE_TYPES.len();
+                            ty = if k.code == KeyCode::Left { (ty + n - 1) % n } else { (ty + 1) % n };
+                        }
+                        KeyCode::Enter | KeyCode::Char(' ') if focus == 1 => {
+                            let items = SITE_TYPES.iter().map(|(label, _, _)| (label.to_string(), label.to_string())).collect();
+                            open = Some(SiteList { items, sel: ty, query: String::new() });
+                        }
+                        // a field that has suggestions: Enter opens them (typing in the field is allowed too)
+                        KeyCode::Enter if focus >= 2 && focus < ok && fields[focus - 2].pick != Pick::None => {
+                            let f = &fields[focus - 2];
+                            let mut items: Vec<(String, String)> = match f.pick {
+                                Pick::Hosts => sugg.hosts.iter().map(|h| (h.clone(), h.clone())).collect(),
+                                Pick::Keys => sugg.keys.iter().map(|h| (h.clone(), h.clone())).collect(),
+                                Pick::Remotes => sugg.remotes.iter().map(|h| (h.clone(), h.clone())).collect(),
+                                Pick::None => Vec::new(),
+                            };
+                            if f.pick == Pick::Keys {
+                                items.insert(0, ("none — the ssh-agent or a password".to_string(), String::new()));
+                            }
+                            if items.is_empty() {
+                                let why = match f.pick {
+                                    Pick::Hosts => "~/.ssh/config has no hosts: type the server's address",
+                                    Pick::Remotes => "rclone has no remotes yet: run `rclone config` in a terminal to make one",
+                                    _ => "nothing to choose from: type it",
+                                };
+                                self.toast(why, false);
+                            } else {
+                                let cur = vals.get(f.key).cloned().unwrap_or_default();
+                                let sel = items.iter().position(|(_, v)| *v == cur).unwrap_or(0);
+                                open = Some(SiteList { items, sel, query: String::new() });
+                            }
+                        }
+                        KeyCode::Enter if focus == cancel => keep = false,
+                        KeyCode::Enter if focus == ok => match self.site_save(&name, locked, ty, &vals) {
+                            Ok(()) => {
+                                // saved: the list of connections opens at once, with this one in it
+                                keep = false;
+                                self.toast(format!("{name} saved in {}", lvim_fuzzy_plugin_remote::sites::file(&self.sites_root()).display()), false);
+                                self.remote_connect(NamesFor::Open);
+                            }
+                            Err(e) => note = e,
+                        },
+                        KeyCode::Enter => focus = (focus + 1) % rows,
+                        KeyCode::Backspace if focus == 0 && !locked => {
+                            name.pop();
+                        }
+                        KeyCode::Char(c) if focus == 0 && !locked && !ctrl => name.push(c),
+                        KeyCode::Char('u') if ctrl && focus == 0 && !locked => name.clear(),
+                        KeyCode::Backspace if focus >= 2 && focus < ok => {
+                            vals.entry(fields[focus - 2].key.to_string()).or_default().pop();
+                        }
+                        KeyCode::Char('u') if ctrl && focus >= 2 && focus < ok => {
+                            vals.insert(fields[focus - 2].key.to_string(), String::new());
+                        }
+                        KeyCode::Char(c) if focus >= 2 && focus < ok && !ctrl => {
+                            vals.entry(fields[focus - 2].key.to_string()).or_default().push(c);
+                        }
+                        _ => {}
+                    }
+                }
+                if keep {
+                    self.dialog = Some(Dialog::Site { name, locked, ty, vals, focus, open, sugg, note });
+                }
+            }
+            Dialog::Tasks { mut sel } => {
+                let n = self.jobs.len();
+                match k.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {}
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        sel = sel.saturating_sub(1);
+                        self.dialog = Some(Dialog::Tasks { sel });
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        sel = (sel + 1).min(n.saturating_sub(1));
+                        self.dialog = Some(Dialog::Tasks { sel });
+                    }
+                    KeyCode::Char('x') | KeyCode::Delete => {
+                        if let Some(rj) = self.jobs.get(sel) {
+                            rj.job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        self.dialog = Some(Dialog::Tasks { sel });
+                    }
+                    _ => self.dialog = Some(Dialog::Tasks { sel }),
+                }
+            }
             Dialog::Menu { title, items, mut sel } => match k.code {
                 KeyCode::Esc => {}
                 KeyCode::Enter => {
@@ -1565,23 +3315,39 @@ impl App {
                 }
                 self.dialog = Some(Dialog::Columns { sel });
             }
-            Dialog::Owner { paths, users, groups, mut user, mut group, mut focus, mut open } => {
-                let list = |f: usize| if f == 0 { &users } else { &groups };
-                let matches = |f: usize, q: &str| -> Vec<usize> {
+            Dialog::Owner { paths, users, groups, mut user, mut group, mut members, remote, mut focus, mut open } => {
+                // row 0 is the group, row 1 the user: the user list holds only the people of the chosen group
+                let matches = |f: usize, q: &str, members: &[String]| -> Vec<usize> {
                     let q = q.to_lowercase();
-                    list(f).iter().enumerate().filter(|(_, n)| n.to_lowercase().contains(&q)).map(|(i, _)| i).collect()
+                    let list = if f == 0 { &groups } else { &users };
+                    list.iter()
+                        .enumerate()
+                        .filter(|(_, n)| n.to_lowercase().contains(&q) && (f == 0 || members.contains(n)))
+                        .map(|(i, _)| i)
+                        .collect()
                 };
                 if let Some((mut q, mut sel)) = open.take() {
                     // a drop-down is open: j / k (↑ ↓, Ctrl-n / Ctrl-p) move, typing filters, Enter picks
-                    let m = matches(focus, &q);
+                    let m = matches(focus, &q, &members);
                     match k.code {
                         KeyCode::Esc => {}
                         KeyCode::Enter => {
                             if let Some(&i) = m.get(sel) {
                                 if focus == 0 {
-                                    user = i;
-                                } else {
                                     group = i;
+                                    members = match &remote {
+                                        Some(ids) => ids.members(&groups[group]),
+                                        None => fsx::group_members(&groups[group]),
+                                    };
+                                    // the group decides the user: the one chosen stays only if the group has him,
+                                    // else the first person of the group
+                                    if !members.contains(&users[user])
+                                        && let Some(first) = users.iter().position(|u| members.contains(u))
+                                    {
+                                        user = first;
+                                    }
+                                } else {
+                                    user = i;
                                 }
                             }
                         }
@@ -1620,21 +3386,28 @@ impl App {
                         KeyCode::Left | KeyCode::Char('h') if focus == 3 => focus = 2,
                         KeyCode::Enter | KeyCode::Char(' ') if focus < 2 => {
                             // open on the current choice
-                            let cur = if focus == 0 { user } else { group };
-                            open = Some((String::new(), cur));
+                            // the selected row is the current choice among what the drop-down lists
+                            let cur = if focus == 0 { group } else { user };
+                            let at = matches(focus, "", &members).iter().position(|&i| i == cur).unwrap_or(0);
+                            open = Some((String::new(), at));
                         }
                         KeyCode::Enter | KeyCode::Char(' ') if focus == 2 => {
                             let spec = format!("{}:{}", users[user], groups[group]);
-                            return self.submit(InputAction::Chown(paths), spec, term);
+                            let act = match &remote {
+                                Some(ids) => InputAction::RemoteChown { remote: ids.remote.clone(), paths: paths.iter().map(|p| p.to_string_lossy().into_owned()).collect() },
+                                None => InputAction::Chown(paths),
+                            };
+                            return self.submit(act, spec, term);
                         }
                         KeyCode::Enter | KeyCode::Char(' ') => return Ok(()),
                         _ => {}
                     }
                 }
-                self.dialog = Some(Dialog::Owner { paths, users, groups, user, group, focus, open });
+                self.dialog = Some(Dialog::Owner { paths, users, groups, user, group, members, remote, focus, open });
             }
             Dialog::Mode {
                 paths,
+                remote,
                 mut value,
                 mut cur,
                 base,
@@ -1646,7 +3419,13 @@ impl App {
                 let mut edited = false;
                 match k.code {
                     KeyCode::Esc => return Ok(()),
-                    KeyCode::Enter => return self.submit(InputAction::Chmod(paths), value, term),
+                    KeyCode::Enter => {
+                        let act = match remote {
+                            Some(r) => InputAction::RemoteChmod { remote: r, paths: paths.iter().map(|p| p.to_string_lossy().into_owned()).collect() },
+                            None => InputAction::Chmod(paths),
+                        };
+                        return self.submit(act, value, term);
+                    }
                     KeyCode::Tab => focus = (focus + 1) % 13,
                     KeyCode::BackTab => focus = (focus + 12) % 13,
                     // the ticks: a 3 × 3 grid (owner / group / others × r w x), then the special row
@@ -1714,7 +3493,7 @@ impl App {
                 if edited && let Ok(m) = fsx::parse_mode(&value, base, is_dir) {
                     bits = m;
                 }
-                self.dialog = Some(Dialog::Mode { paths, value, cur, base, is_dir, bits, focus });
+                self.dialog = Some(Dialog::Mode { paths, remote, value, cur, base, is_dir, bits, focus });
             }
             Dialog::Input {
                 title,
@@ -1725,7 +3504,56 @@ impl App {
                 let chars: Vec<char> = value.chars().collect();
                 let mut action = action;
                 let mut title = title;
+                if k.code != KeyCode::Tab {
+                    self.comp = None;
+                }
                 match k.code {
+                    KeyCode::Tab if matches!(action, InputAction::Shell) => {
+                        let at_cursor = chars.len().min(cur);
+                        let (start, len, text) = match self.comp.as_mut() {
+                            // Tab again: the next candidate
+                            Some(c) if !c.cands.is_empty() => {
+                                let i = c.idx.map(|i| (i + 1) % c.cands.len()).unwrap_or(0);
+                                c.idx = Some(i);
+                                (c.start, c.len, Some(c.cands[i].clone()))
+                            }
+                            _ => {
+                                let dir = self.p().dir().map(Path::to_path_buf).unwrap_or_else(fsx::home);
+                                let before: String = chars[..at_cursor].iter().collect();
+                                let (bstart, cands) = crate::complete::candidates(&before, &dir);
+                                let start = before[..bstart].chars().count();
+                                let typed = at_cursor - start;
+                                match cands.len() {
+                                    0 => (start, typed, None),
+                                    1 => {
+                                        let mut t = cands[0].clone();
+                                        if !t.ends_with('/') {
+                                            t.push(' ');
+                                        }
+                                        (start, typed, Some(t))
+                                    }
+                                    _ => {
+                                        let cp = crate::complete::common_prefix(&cands);
+                                        let grew = cp.chars().count() > typed;
+                                        let shown = if grew { Some(cp.clone()) } else { None };
+                                        self.comp = Some(Comp { start, cands, idx: None, len: if grew { cp.chars().count() } else { typed } });
+                                        (start, typed, shown)
+                                    }
+                                }
+                            }
+                        };
+                        if let Some(t) = text {
+                            let n = t.chars().count();
+                            let mut v: Vec<char> = chars[..start].to_vec();
+                            v.extend(t.chars());
+                            v.extend(chars[(start + len).min(chars.len())..].iter());
+                            value = v.into_iter().collect();
+                            cur = start + n;
+                            if let Some(c) = self.comp.as_mut() {
+                                c.len = n;
+                            }
+                        }
+                    }
                     KeyCode::Esc => return Ok(()),
                     KeyCode::Enter => return self.submit(action, value, term),
                     KeyCode::Tab if matches!(action, InputAction::Symlink { .. }) => {
@@ -1733,6 +3561,12 @@ impl App {
                             *relative = !*relative;
                             title = symlink_title(targets.len(), *relative);
                         }
+                    }
+                    KeyCode::Up | KeyCode::Down if matches!(action, InputAction::Shell) => {
+                        let n = self.shell_history.len();
+                        self.hist_at = if k.code == KeyCode::Up { self.hist_at.saturating_sub(1) } else { (self.hist_at + 1).min(n) };
+                        value = self.shell_history.get(self.hist_at).cloned().unwrap_or_default();
+                        cur = value.chars().count();
                     }
                     KeyCode::Char('u') if ctrl => {
                         value.clear();
@@ -1784,6 +3618,20 @@ impl App {
     }
 
     /// `~` and relative paths (to the active panel's directory) resolved.
+    /// A copy / move target may end in a rename mask (`~/out/*.md`, `**.bak`): the directory and the mask.
+    fn split_mask(&self, value: &str) -> (PathBuf, Option<String>) {
+        let v = value.trim();
+        let (dir, last) = match v.rfind('/') {
+            Some(i) => (&v[..=i], &v[i + 1..]),
+            None => ("", v),
+        };
+        if !last.contains('*') {
+            return (self.resolve(v), None);
+        }
+        let dest = if dir.is_empty() { self.other().dir().map(Path::to_path_buf).unwrap_or_else(|| self.resolve(".")) } else { self.resolve(dir) };
+        (dest, Some(last.to_string()))
+    }
+
     fn resolve(&self, s: &str) -> PathBuf {
         let s = s.trim();
         let p = if s == "~" {
@@ -1812,7 +3660,9 @@ impl App {
                 match std::fs::create_dir_all(&p) {
                     Ok(()) => {
                         if !existed {
-                            self.undo.push(vec![ops::Undo::Created(p.clone())]);
+                            self.redo.clear();
+                            self.redo.clear();
+                        self.undo.push(vec![ops::Undo::Created(p.clone())]);
                         }
                         self.pm().reload();
                         if let Some(n) = p.file_name() {
@@ -1822,6 +3672,71 @@ impl App {
                     }
                     Err(e) => self.toast(format!("{}: {e}", p.display()), true),
                 }
+            }
+            InputAction::RemoteChmod { remote, paths } => {
+                if let Err(e) = fsx::parse_mode(value.trim(), 0o644, false) {
+                    self.toast(e, true);
+                    return Ok(());
+                }
+                // octal, or symbolic against each item's own mode (the listing has it)
+                let modes: std::collections::HashMap<String, (u32, bool)> = {
+                    let p = self.p();
+                    p.entries.iter().filter_map(|e| p.remote_path_of(e).map(|rp| (rp, (e.mode & 0o7777, e.is_dir())))).collect()
+                };
+                let mut steps = Vec::new();
+                for path in &paths {
+                    let (cur, dir) = modes.get(path).copied().unwrap_or((0o644, false));
+                    match fsx::parse_mode(value.trim(), cur, dir) {
+                        Ok(m) => steps.push(vec!["chmod".to_string(), remote.clone(), path.clone(), format!("{:o}", m & 0o7777)]),
+                        Err(e) => {
+                            self.toast(e, true);
+                            return Ok(());
+                        }
+                    }
+                }
+                self.remote_job(JobKind::Copy, format!("mode {}", value.trim()), steps, None);
+            }
+            InputAction::RemoteChown { remote, paths } => {
+                let (user, group) = value.split_once(':').unwrap_or((value.as_str(), ""));
+                let steps = paths.iter().map(|p| vec!["chown".to_string(), remote.clone(), p.clone(), user.to_string(), group.to_string()]).collect();
+                self.remote_job(JobKind::Copy, format!("owner {value}"), steps, None);
+            }
+            InputAction::RemoteLink { remote, dir, target } => {
+                let name = value.trim();
+                if name.is_empty() || name.contains('/') {
+                    self.toast("a name, without /", true);
+                    return Ok(());
+                }
+                let path = crate::panel::remote_join(&dir, name);
+                self.remote_job(JobKind::Copy, name.to_string(), vec![vec!["symlink".into(), remote, path, target]], None);
+            }
+            InputAction::RemotePassword { remote } => {
+                if value.is_empty() {
+                    return Ok(());
+                }
+                self.session_pw.insert(remote, value);
+                self.pm().reload();
+            }
+            InputAction::RemoteNew { remote, dir } => {
+                let name = value.trim();
+                if name.is_empty() {
+                    return Ok(());
+                }
+                let path = crate::panel::remote_join(&dir, name.trim_end_matches('/'));
+                let verb = if name.ends_with('/') { "mkdir" } else { "touch" };
+                self.remote_job(JobKind::Copy, name.trim_end_matches('/').to_string(), vec![vec![verb.into(), remote, path]], None);
+            }
+            InputAction::RemoteRename { remote, path } => {
+                let name = value.trim();
+                if name.is_empty() || name.contains('/') {
+                    self.toast("a name, without /", true);
+                    return Ok(());
+                }
+                let to = match crate::panel::remote_parent(&path) {
+                    Some(parent) => crate::panel::remote_join(&parent, name),
+                    None => name.to_string(),
+                };
+                self.remote_job(JobKind::Move, name.to_string(), vec![vec!["mv".into(), remote, path, to]], None);
             }
             InputAction::NewFile if value.trim().ends_with('/') => {
                 return self.submit(InputAction::Mkdir, value.trim().trim_end_matches('/').to_string() + "/", term);
@@ -1843,6 +3758,7 @@ impl App {
                 }
                 match std::fs::OpenOptions::new().write(true).create_new(true).open(&p) {
                     Ok(_) => {
+                        self.redo.clear();
                         self.undo.push(vec![ops::Undo::Created(p.clone())]);
                         // a name with a directory part: the panel goes there, on the new file
                         if let Some(parent) = p.parent()
@@ -1871,6 +3787,7 @@ impl App {
                 }
                 match std::fs::rename(&from, &to) {
                     Ok(()) => {
+                        self.redo.clear();
                         self.undo.push(vec![ops::Undo::Moved {
                             from: from.clone(),
                             to: to.clone(),
@@ -1922,6 +3839,7 @@ impl App {
                     }
                 }
                 if !made.is_empty() {
+                    self.redo.clear();
                     self.undo.push(made.iter().cloned().map(ops::Undo::Created).collect());
                 }
                 for p in &mut self.panels {
@@ -1953,12 +3871,19 @@ impl App {
                 }
             }
             InputAction::CopyTo(src) => {
-                let dest = self.resolve(&value);
-                self.start_job(JobKind::Copy, src, Some(dest));
+                let (dest, mask) = self.split_mask(&value);
+                self.start_job_masked(JobKind::Copy, src, Some(dest), mask);
+            }
+            InputAction::PasteTo(src, cut) => {
+                let (dest, mask) = self.split_mask(&value);
+                if cut {
+                    crate::config::save_buffer(&crate::config::Buffer::default());
+                }
+                self.start_job_masked(if cut { JobKind::Move } else { JobKind::Copy }, src, Some(dest), mask);
             }
             InputAction::MoveTo(src) => {
-                let dest = self.resolve(&value);
-                self.start_job(JobKind::Move, src, Some(dest));
+                let (dest, mask) = self.split_mask(&value);
+                self.start_job_masked(JobKind::Move, src, Some(dest), mask);
             }
             InputAction::Mark(on) => {
                 let n = self.pm().mark_glob(value.trim(), on);
@@ -1978,30 +3903,39 @@ impl App {
                 }
             }
             InputAction::Shell => {
-                if value.trim().is_empty() {
+                let cmd = value.trim();
+                if cmd.is_empty() {
                     return Ok(());
                 }
-                let dir = self.p().dir().map(Path::to_path_buf).unwrap_or_else(fsx::home);
-                term.suspend()?;
-                let st = std::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(&value)
-                    .current_dir(&dir)
-                    .status();
-                if let Err(e) = st {
-                    eprintln!("lvc: {e}");
+                if self.shell_history.last().map(String::as_str) != Some(cmd) {
+                    self.shell_history.push(cmd.to_string());
+                    crate::config::save_shell_history(&self.shell_history);
                 }
-                eprint!("\n[lvc] press a key to return ");
-                crossterm::terminal::enable_raw_mode()?;
-                loop {
-                    if let Event::Key(_) = event::read()? {
-                        break;
+                // in this panel's directory, typed into the one shell (its aliases, history, colours)
+                let dir = self.p().dir().map(Path::to_path_buf).unwrap_or_else(fsx::home);
+                if self.subshell.is_none() {
+                    match crate::subshell::Subshell::start(&dir) {
+                        Ok(s) => self.subshell = Some(s),
+                        Err(e) => {
+                            self.toast(format!("the shell did not start: {e}"), true);
+                            return Ok(());
+                        }
                     }
                 }
-                term.resume()?;
-                for p in &mut self.panels {
-                    p.reload();
+                // a `cd` first only when the shell is somewhere else
+                let line = if self.subshell.as_ref().and_then(|s| s.cwd()).as_deref() == Some(dir.as_path()) {
+                    format!("{cmd}\n")
+                } else {
+                    let quoted = format!("'{}'", dir.to_string_lossy().replace('\'', "'\\''"));
+                    format!("cd -- {quoted} && {cmd}\n")
+                };
+                if let Some(sh) = &self.subshell
+                    && let Err(e) = sh.send(&line)
+                {
+                    self.toast(format!("the shell: {e}"), true);
+                    return Ok(());
                 }
+                return self.subshell(term);
             }
         }
         Ok(())
@@ -2013,6 +3947,28 @@ impl App {
             ConfirmAction::Delete(paths, direct) => {
                 let kind = if direct { JobKind::Delete } else { JobKind::Trash };
                 self.start_job(kind, paths, None);
+            }
+            ConfirmAction::SiteDelete(name) => match lvim_fuzzy_plugin_remote::sites::delete(&self.sites_root(), &name) {
+                Ok(true) => {
+                    self.remote_reset();
+                    self.toast(format!("{name} deleted"), false);
+                }
+                Ok(false) => self.toast(format!("{name} is not in the settings file of the plugin (rclone's remotes are deleted with `rclone config`)"), true),
+                Err(e) => self.toast(e, true),
+            },
+            ConfirmAction::RemoteRm { remote, items } => {
+                let steps: Vec<Vec<String>> = items
+                    .iter()
+                    .map(|(p, dir)| {
+                        let mut v = vec!["rm".to_string(), remote.clone(), p.clone()];
+                        if *dir {
+                            v.push("dir".into());
+                        }
+                        v
+                    })
+                    .collect();
+                let label = if items.len() == 1 { items[0].0.rsplit('/').next().unwrap_or("").to_string() } else { format!("{} items", items.len()) };
+                self.remote_job(JobKind::Delete, label, steps, None);
             }
             ConfirmAction::Purge(items) => {
                 let mut errs = Vec::new();
@@ -2054,6 +4010,10 @@ impl App {
     // ── operations ──────────────────────────────────────────────────────────────────────────────────
 
     fn copy_move(&mut self, mv: bool) {
+        if self.p().remote().is_some() || self.other().remote().is_some() {
+            self.remote_copy_move(mv);
+            return;
+        }
         if self.p().is_trash() {
             if mv {
                 self.restore();
@@ -2086,6 +4046,12 @@ impl App {
     }
 
     fn rename(&mut self) {
+        if let Some((remote, _)) = self.p().remote().map(|(r, p)| (r.to_string(), p.to_string())) {
+            let Some(e) = self.p().current().cloned().filter(|e| !e.is_parent()) else { return };
+            let Some(path) = self.p().remote_path_of(&e) else { return };
+            self.input("Rename on the remote", &e.name, InputAction::RemoteRename { remote, path });
+            return;
+        }
         if self.p().is_trash() {
             return;
         }
@@ -2098,6 +4064,10 @@ impl App {
     }
 
     fn delete(&mut self, direct: bool) {
+        if self.p().remote().is_some() {
+            self.remote_delete();
+            return;
+        }
         if self.p().is_trash() {
             let items = self.p().trash_targets();
             if items.is_empty() {
@@ -2142,23 +4112,22 @@ impl App {
     }
 
     fn start_command(&mut self, kind: JobKind, cmd: std::process::Command, label: String, made: Option<PathBuf>) {
-        if self.job.is_some() {
-            self.toast("another operation is running", true);
-            return;
-        }
-        self.job = Some(RunningJob {
-            job: wake_on(ops::start_command(kind, cmd, label, made), self.wake_tx.clone()),
-            done: 0,
-            total: 0,
-            file: String::new(),
-            started: Instant::now(),
-        });
+        let job = wake_on(ops::start_command(kind, cmd, label, made), self.wake_tx.clone());
+        self.add_job(job);
     }
 
     fn menu_pick(&mut self, it: MenuItem, term: &mut Term) -> std::io::Result<()> {
         match it {
             MenuItem::Plugin(c, arg) => self.plugin_call(&c, arg.as_deref()),
             MenuItem::Dir(p) => self.pm().go(Place::Dir(p)),
+            MenuItem::RemoteEdit(name) => self.site_form(Some(name)),
+            MenuItem::RemoteDelete(name) => {
+                self.dialog = Some(Dialog::Confirm {
+                    title: "Delete a connection".into(),
+                    lines: vec![format!("Delete the connection `{name}` from the settings?")],
+                    action: ConfirmAction::SiteDelete(name),
+                });
+            }
             MenuItem::Action(i) => self.run_action(i, term)?,
             MenuItem::Builtin(b) => self.builtin(b, term)?,
             MenuItem::Peer(peer) => {
@@ -2237,7 +4206,7 @@ impl App {
                 self.input("Go to directory", &d, InputAction::Goto)
             }
             Builtin::Bookmarks => self.bookmarks(),
-            Builtin::Shell => self.input("Shell command", "", InputAction::Shell),
+            Builtin::Shell => self.command_line(),
             Builtin::TrashView => {
                 if self.p().is_trash() {
                     self.pm().back_in_history();
@@ -2278,7 +4247,7 @@ impl App {
         let kw = BUILTINS.iter().map(|b| b.2.len()).max().unwrap_or(4);
         let mut items: Vec<(String, MenuItem)> = BUILTINS
             .iter()
-            .map(|(b, title, key)| (format!("{:<kw$}  {title}", self.show_key(&key.replace("C-c ", "C-c "))), MenuItem::Builtin(*b)))
+            .map(|(b, title, key)| (format!("{:<kw$}  {title}", self.show_key(key)), MenuItem::Builtin(*b)))
             .collect();
         let user: Vec<(String, MenuItem)> = self
             .actions
@@ -2608,6 +4577,7 @@ impl App {
             return;
         };
         let mut errs = Vec::new();
+        let mut again: Vec<Redo> = Vec::new();
         let n = ops_.len();
         for u in ops_.into_iter().rev() {
             let r = match &u {
@@ -2615,20 +4585,60 @@ impl App {
                     if from.symlink_metadata().is_ok() {
                         Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, format!("{} exists", from.display())))
                     } else {
-                        ops::move_path(to, from, &mut |_| true)
+                        ops::move_path(to, from, &mut |_| true).map(|()| again.push(Redo::Move { from: from.clone(), to: to.clone() }))
                     }
                 }
-                ops::Undo::Trashed(it) => crate::trash::restore(it, None).map(|_| ()),
-                ops::Undo::Created(p) => crate::trash::trash(p).map(|_| ()),
+                ops::Undo::Trashed(it) => crate::trash::restore(it, None).map(|_| again.push(Redo::Trash(it.original.clone()))),
+                ops::Undo::Created(p) => crate::trash::trash(p).map(|item| again.push(Redo::Restore(item))),
             };
             if let Err(e) = r {
                 errs.push(format!("{e}"));
             }
         }
-        self.after_trash_op(n - errs.len(), errs, "undone");
+        // redo does them again in the order they were first done
+        again.reverse();
+        if !again.is_empty() {
+            self.redo.push(again);
+        }
+        self.after_trash_op(n - errs.len(), errs, "undone (R does it again)");
+    }
+
+    /// `R`: what the last undo took back is done again (and can be undone again).
+    fn redo_last(&mut self) {
+        let Some(items) = self.redo.pop() else {
+            self.toast("nothing to redo", false);
+            return;
+        };
+        let mut errs = Vec::new();
+        let mut undo: Vec<ops::Undo> = Vec::new();
+        let n = items.len();
+        for r in items {
+            let res = match r {
+                Redo::Move { from, to } => {
+                    if to.symlink_metadata().is_ok() {
+                        Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, format!("{} exists", to.display())))
+                    } else {
+                        ops::move_path(&from, &to, &mut |_| true).map(|()| undo.push(ops::Undo::Moved { from, to }))
+                    }
+                }
+                Redo::Trash(p) => crate::trash::trash(&p).map(|item| undo.push(ops::Undo::Trashed(item))),
+                Redo::Restore(item) => crate::trash::restore(&item, None).map(|p| undo.push(ops::Undo::Created(p))),
+            };
+            if let Err(e) = res {
+                errs.push(format!("{e}"));
+            }
+        }
+        if !undo.is_empty() {
+            self.undo.push(undo);
+        }
+        self.after_trash_op(n - errs.len(), errs, "done again (u takes it back)");
     }
 
     fn new_file(&mut self) {
+        if let Some((remote, dir)) = self.p().remote().map(|(r, p)| (r.to_string(), p.to_string())) {
+            self.input("New on the remote — a name ending in / is a directory", "", InputAction::RemoteNew { remote, dir });
+            return;
+        }
         if !self.p().is_trash() {
             self.input("New — a name ending in / is a directory", "", InputAction::NewFile)
         }
@@ -2636,6 +4646,18 @@ impl App {
 
     fn chmod(&mut self) {
         if self.p().is_trash() {
+            return;
+        }
+        if let Some((remote, _)) = self.p().remote().map(|(r, p)| (r.to_string(), p.to_string())) {
+            let p = self.p();
+            let names: Vec<String> = if p.marked.is_empty() { p.current().filter(|e| !e.is_parent()).map(|e| e.name.clone()).into_iter().collect() } else { p.marked.iter().cloned().collect() };
+            let paths: Vec<PathBuf> = p.entries.iter().filter(|e| names.contains(&e.name)).filter_map(|e| p.remote_path_of(e)).map(PathBuf::from).collect();
+            if paths.is_empty() {
+                return;
+            }
+            let (base, is_dir) = p.current().filter(|e| !e.is_parent()).map(|e| (e.mode & 0o7777, e.is_dir())).unwrap_or((0o644, false));
+            let value = format!("{base:o}");
+            self.dialog = Some(Dialog::Mode { paths, remote: Some(remote), cur: value.chars().count(), value, base, is_dir, bits: base, focus: 0 });
             return;
         }
         let t = self.p().targets();
@@ -2651,6 +4673,7 @@ impl App {
         let value = format!("{base:o}");
         self.dialog = Some(Dialog::Mode {
             paths: t,
+            remote: None,
             cur: value.chars().count(),
             value,
             base,
@@ -2664,6 +4687,28 @@ impl App {
     /// real users and groups.
     fn chown(&mut self) {
         if self.p().is_trash() {
+            return;
+        }
+        if let Some((remote, _)) = self.p().remote().map(|(r, p)| (r.to_string(), p.to_string())) {
+            // the REAL users and groups are the remote machine's own: asked for first, the dialog opens with the answer
+            let p = self.p();
+            let names: Vec<String> = if p.marked.is_empty() { p.current().filter(|e| !e.is_parent()).map(|e| e.name.clone()).into_iter().collect() } else { p.marked.iter().cloned().collect() };
+            let paths: Vec<String> = p.entries.iter().filter(|e| names.contains(&e.name)).filter_map(|e| p.remote_path_of(e)).collect();
+            if paths.is_empty() {
+                return;
+            }
+            let owner = p.current().filter(|e| !e.is_parent()).map(|e| (e.uid, e.gid)).unwrap_or((0, 0));
+            let mut ctx = serde_json::json!({"remote": remote, "path": "/"});
+            if let Some(site) = self.remote_site(&remote) {
+                ctx["site"] = site;
+            }
+            match self.remote_client().call("users", ctx) {
+                Ok(tag) => {
+                    self.remote_tasks.insert(tag, RemoteTask::Users { remote, paths, owner });
+                    self.toast("reading the users of the remote machine …", false);
+                }
+                Err(e) => self.toast(format!("remote: {e}"), true),
+            }
             return;
         }
         let t = self.p().targets();
@@ -2687,7 +4732,8 @@ impl App {
         }
         let user = users.iter().position(|u| u == &cu).unwrap_or(0);
         let group = groups.iter().position(|g| g == &cg).unwrap_or(0);
-        self.dialog = Some(Dialog::Owner { paths: t, users, groups, user, group, focus: 0, open: None });
+        let members = fsx::group_members(&groups[group]);
+        self.dialog = Some(Dialog::Owner { paths: t, users, groups, user, group, members, remote: None, focus: 0, open: None });
     }
 
     /// Alt-b: the bookmarks of the config, then the directories visited.
@@ -2718,6 +4764,27 @@ impl App {
     /// Alt-a: extract the archive under the cursor into `<other panel>/<archive stem>/`.
     fn extract(&mut self) {
         let Some(e) = self.p().current().cloned() else { return };
+        if self.p().remote().is_some() {
+            // a remote archive: downloaded, then unpacked into the other panel's directory
+            if crate::archive::format(&e.name).is_none() {
+                self.toast("not an archive", false);
+                return;
+            }
+            let Some(base) = self.other().dir().map(Path::to_path_buf) else {
+                self.toast("unpack into a local directory: the other panel is not one", true);
+                return;
+            };
+            let mut dest = base.join(crate::archive::stem(&e.name));
+            if dest.symlink_metadata().is_ok() {
+                dest = ops::free_name(&dest);
+            }
+            if let Err(err) = std::fs::create_dir_all(&dest) {
+                self.toast(format!("{}: {err}", dest.display()), true);
+                return;
+            }
+            self.remote_file_action(AfterFetch::Extract(dest));
+            return;
+        }
         if self.p().is_trash() || crate::archive::format(&e.name).is_none() {
             self.toast("not an archive", false);
             return;
@@ -2835,6 +4902,7 @@ impl App {
             }
         }
         if !undo.is_empty() {
+            self.redo.clear();
             self.undo.push(undo);
         }
         self.after_trash_op(pairs.len() - errs.len(), errs, "renamed");
@@ -2843,8 +4911,38 @@ impl App {
 
     /// Enter on an entry: a directory is entered; a file opens (the `[open]` command for its extension,
     /// the editor for text, else xdg-open).
+    /// `--chooser-file`: the marked items, or the file under the cursor, are written to the file (a path on a line)
+    /// and lvc quits. A directory with no marks is entered as always. Returns whether it chose.
+    fn choose(&mut self) -> bool {
+        let Some(out) = self.chooser.clone() else { return false };
+        let paths = if self.p().marked.is_empty() {
+            match self.p().current() {
+                Some(e) if !e.is_dir() && !e.is_parent() => self.p().current_path().into_iter().collect(),
+                _ => Vec::new(),
+            }
+        } else {
+            self.p().targets()
+        };
+        if paths.is_empty() {
+            return false;
+        }
+        let text: String = paths.iter().map(|p| format!("{}\n", p.display())).collect();
+        match std::fs::write(&out, text) {
+            Ok(()) => self.quit = true,
+            Err(e) => self.toast(format!("{}: {e}", out.display()), true),
+        }
+        true
+    }
+
+    pub fn set_chooser(&mut self, file: PathBuf) {
+        self.chooser = Some(file);
+    }
+
     fn open_current(&mut self, term: &mut Term) -> std::io::Result<()> {
         if self.p().is_trash() {
+            return Ok(());
+        }
+        if self.choose() {
             return Ok(());
         }
         let Some(e) = self.p().current().cloned() else {
@@ -2854,9 +4952,26 @@ impl App {
             self.pm().enter();
             return Ok(());
         }
+        if self.p().remote().is_some() {
+            let archive = crate::archive::format(&e.name).is_some();
+            // `enter = "download"` (the default): the file goes to the folder of the other panel, as a double click in FileZilla
+            let download = self.remote_client().config()["enter"].as_str().unwrap_or("download") == "download";
+            if download && !archive && self.other().dir().is_some() {
+                self.remote_copy_move(false);
+                return Ok(());
+            }
+            // else its copy is downloaded into the cache first (an archive is entered, the rest is opened)
+            self.remote_file_action(if archive { AfterFetch::Archive } else { AfterFetch::Open });
+            return Ok(());
+        }
         let Some(path) = self.p().current_path() else {
             return Ok(());
         };
+        // an archive is entered as a directory
+        if crate::archive::format(&e.name).is_some() {
+            self.enter_archive(path);
+            return Ok(());
+        }
         // what the open plugin says (the one rule lfz and the Neovim picker use too): a program, run detached, or
         // the editor; a program that is not installed is said and nothing is opened
         let opener = self.opener.get_or_insert_with(|| {
@@ -2876,9 +4991,48 @@ impl App {
         Ok(())
     }
 
+    /// Enter an archive as a directory: it is unpacked once into the cache (`~/.cache/lvim-commander/arc/<key>/x`, the
+    /// key from its path, size and time) and the panel shows that; `h` at the top comes back out. What is changed
+    /// there is not written back to the archive.
+    fn enter_archive(&mut self, path: PathBuf) {
+        use std::hash::{Hash, Hasher};
+        use std::os::unix::fs::MetadataExt;
+        let Ok(md) = std::fs::metadata(&path) else { return };
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (&path, md.len(), md.mtime(), md.mtime_nsec()).hash(&mut h);
+        let key_dir = arc_cache().join(format!("{:016x}", h.finish()));
+        let root = key_dir.join("x");
+        let (tab, panel) = (self.tab, self.active);
+        if key_dir.join("done").exists() {
+            self.panels[panel].enter_archive(path, root);
+            self.pv_follow();
+            return;
+        }
+        if let Err(e) = std::fs::create_dir_all(&root) {
+            self.toast(format!("{}: {e}", root.display()), true);
+            return;
+        }
+        let Some(cmd) = crate::archive::extract_cmd(&path, &root) else {
+            self.toast("not an archive", false);
+            return;
+        };
+        let label = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        self.arc_enter = Some(ArcEnter { job: self.next_job, tab, panel, archive: path, root });
+        self.start_command(JobKind::Extract, cmd, label, None);
+    }
+
     fn edit_current(&mut self, term: &mut Term) -> std::io::Result<()> {
         // a file, or a directory (the editor opens it: nvim shows its file browser); `..` = this directory
         if self.p().is_trash() {
+            return Ok(());
+        }
+        if let Some((remote, _)) = self.p().remote().map(|(r, p)| (r.to_string(), p.to_string())) {
+            // the copy is edited, and goes back when it changed
+            if let Some(e) = self.p().current().cloned().filter(|e| !e.is_parent() && !e.is_dir())
+                && let Some(rpath) = self.p().remote_path_of(&e)
+            {
+                self.remote_file_action(AfterFetch::Edit(remote, rpath));
+            }
             return Ok(());
         }
         let path = match self.p().current() {
@@ -2911,6 +5065,115 @@ impl App {
             p.reload();
         }
         Ok(())
+    }
+
+    /// Download a remote file into the cache (a job: it shows in the operations) and do `then` with the copy when it is there.
+    fn start_fetch(&mut self, remote: &str, rpath: &str, cache: PathBuf, then: AfterFetch) {
+        if self.fetching.contains(&cache) {
+            return;
+        }
+        let part = PathBuf::from(format!("{}.part", cache.display()));
+        let q = |p: &Path| lvim_fuzzy_plugin_remote::engine::quote(&p.to_string_lossy());
+        let steps = vec![vec!["get".to_string(), remote.to_string(), rpath.to_string(), part.to_string_lossy().into_owned()]];
+        let label = rpath.rsplit('/').next().unwrap_or("").to_string();
+        let mv = format!("mv -f -- {} {}", q(&part), q(&cache));
+        if let Some(id) = self.remote_job(JobKind::Copy, label, steps, Some(mv)) {
+            self.fetching.insert(cache.clone());
+            self.fetch_jobs.insert(id, Fetch { cache, then });
+        }
+    }
+
+    /// The local copy of the remote file under the cursor, started downloading when it is not there (and small enough for
+    /// the quick view); `fetch`: whether to start a download at all.
+    fn remote_copy_of_current(&mut self, fetch: bool) -> Option<PathBuf> {
+        let (remote, _) = self.p().remote().map(|(r, p)| (r.to_string(), p.to_string()))?;
+        let e = self.p().current().cloned().filter(|e| !e.is_parent() && !e.is_dir())?;
+        let rpath = self.p().remote_path_of(&e)?;
+        let cache = lvim_fuzzy_plugin_remote::engine::cache_file(&remote, &rpath, e.size, e.mtime);
+        if cache.exists() {
+            return Some(cache);
+        }
+        let limit = self.remote_client().config()["preview"].as_u64().unwrap_or(8) << 20;
+        if fetch && e.size <= limit && !self.fetch_failed.contains_key(&cache) {
+            self.start_fetch(&remote, &rpath, cache, AfterFetch::Preview);
+        }
+        None
+    }
+
+    /// The path the quick view and the preview follow: the file under the cursor — for a remote file, its copy in the cache.
+    fn pcur(&mut self) -> Option<PathBuf> {
+        if self.p().remote().is_some() {
+            let fetch = self.quick || self.viewer;
+            return self.remote_copy_of_current(fetch);
+        }
+        self.p().current_path()
+    }
+
+    /// What waits for a download that is done: open, enter, unpack, edit.
+    fn run_after_fetch(&mut self, term: &mut Term) -> std::io::Result<()> {
+        for (cache, then) in std::mem::take(&mut self.after_fetch) {
+            match then {
+                AfterFetch::Preview => {}
+                AfterFetch::Open => {
+                    let shown = fsx::tilde(&cache);
+                    self.open_file(term, cache)?;
+                    if self.toast.is_none() {
+                        self.toast(format!("opened — the copy is {shown}"), false);
+                    }
+                }
+                AfterFetch::Archive => self.enter_archive(cache),
+                AfterFetch::Extract(dest) => match crate::archive::extract_cmd(&cache, &dest) {
+                    Some(cmd) => self.start_command(JobKind::Extract, cmd, cache.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), Some(dest)),
+                    None => self.toast("not an archive", false),
+                },
+                AfterFetch::Edit(remote, rpath) => {
+                    let sig = |p: &Path| std::fs::metadata(p).map(|m| (m.len(), m.modified().ok())).ok();
+                    let before = sig(&cache);
+                    self.edit(term, &cache)?;
+                    if sig(&cache) != before {
+                        // changed: it goes back (the cached copy is the new one: it is kept under the old key, which the next listing replaces)
+                        let steps = vec![vec!["put".to_string(), remote, rpath.clone(), cache.to_string_lossy().into_owned()]];
+                        self.remote_job(JobKind::Copy, format!("{} (saved)", rpath.rsplit('/').next().unwrap_or("")), steps, None);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Open a local file as Enter does: the open plugin's decision.
+    fn open_file(&mut self, term: &mut Term, path: PathBuf) -> std::io::Result<()> {
+        let opener = self.opener.get_or_insert_with(|| {
+            let (wake, _rx) = channel();
+            lvim_fuzzy_plugin::Previewer::load(&crate::config::plugin_roots(), "lvim-fuzzy-commander", &self.cfg.plugins, wake)
+        });
+        let answer = opener
+            .ask("open", &path, serde_json::json!({"host": "lvim-fuzzy-commander"}), Duration::from_secs(5))
+            .and_then(|t| lvim_fuzzy_ui::open::parse(&t));
+        match answer {
+            Ok(lvim_fuzzy_ui::open::Open::Exec(line)) => self.run_detached(&line),
+            Ok(lvim_fuzzy_ui::open::Open::Editor) => self.edit(term, &path)?,
+            Ok(lvim_fuzzy_ui::open::Open::Missing(m)) => self.toast(m.join("; "), true),
+            Ok(lvim_fuzzy_ui::open::Open::Pass) => self.toast(format!("no open plugin has an answer for {}", path.display()), true),
+            Err(e) => self.toast(e, true),
+        }
+        Ok(())
+    }
+
+    /// Enter / `oe` / `ae` on a remote file: the copy is downloaded first, then `then`.
+    fn remote_file_action(&mut self, then: AfterFetch) {
+        let Some((remote, _)) = self.p().remote().map(|(r, p)| (r.to_string(), p.to_string())) else { return };
+        let Some(e) = self.p().current().cloned().filter(|e| !e.is_parent() && !e.is_dir()) else { return };
+        let Some(rpath) = self.p().remote_path_of(&e) else { return };
+        let cache = lvim_fuzzy_plugin_remote::engine::cache_file(&remote, &rpath, e.size, e.mtime);
+        self.fetch_failed.remove(&cache);
+        if cache.exists() {
+            self.after_fetch.push((cache, then));
+        } else {
+            let name = rpath.rsplit('/').next().unwrap_or("").to_string();
+            self.toast(format!("downloading {name} into the cache ({}); `oc` copies it to the other panel instead", fsx::tilde(cache.parent().unwrap_or(Path::new("/")))), false);
+            self.start_fetch(&remote, &rpath, cache, then);
+        }
     }
 
     /// A GUI program (an image viewer, xdg-open): detached from the terminal and from lvc.
@@ -2995,8 +5258,28 @@ impl App {
             && let Some(&(_, _, n)) = self.footer_btns.iter().find(|(a, b, _)| m.column >= *a && m.column < *b)
         {
             self.footer_focus = None;
-            self.synthetic = true;
-            return self.key(KeyEvent::new(KeyCode::F(n), KeyModifiers::NONE), term);
+            match n {
+                '\u{2039}' => self.footer_scroll(-1),
+                '\u{203a}' => self.footer_scroll(1),
+                _ => {
+                    let code = if n == '\u{1b}' { KeyCode::Esc } else { KeyCode::Char(n) };
+                    let r = self.key(KeyEvent::new(code, KeyModifiers::NONE), term);
+                    // pressed with the mouse: a group of buttons it opened keeps the focus on the bar
+                    if self.group.is_some() {
+                        self.footer_focus = Some(0);
+                    }
+                    return r;
+                }
+            }
+            return Ok(());
+        }
+        if m.row == self.footer_y && matches!(m.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollRight) {
+            self.footer_scroll(1);
+            return Ok(());
+        }
+        if m.row == self.footer_y && matches!(m.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft) {
+            self.footer_scroll(-1);
+            return Ok(());
         }
         let hit = |r: &Rect| m.column >= r.x && m.column < r.x + r.w && m.row >= r.y && m.row < r.y + r.h;
         let Some(i) = (0..2).find(|&i| hit(&self.list_rects[i])) else {
@@ -3041,26 +5324,35 @@ impl App {
         self.draw_title(&mut cv, &l, w);
         let area = Rect { x: 0, y: 1, w, h: h - 2 };
         let mid = w / 2;
-        // the separator between the two halves, as lfz draws it between its list and preview
-        for y in area.y..area.y + area.h {
-            cv.put(mid, y, "│", l.border, mid + 1);
-        }
-        let halves = [
-            Rect { x: 1, y: area.y + 1, w: mid.saturating_sub(2), h: area.h.saturating_sub(2) },
-            Rect { x: mid + 2, y: area.y + 1, w: w.saturating_sub(mid + 3), h: area.h.saturating_sub(2) },
-        ];
-        for (i, &r) in halves.iter().enumerate() {
-            if self.quick && i != self.active {
-                self.list_rects[i] = Rect { x: 0, y: 0, w: 0, h: 0 };
-                self.draw_preview(&mut cv, &l, r);
-            } else {
-                self.draw_panel(&mut cv, &l, i, r);
+        if self.viewer {
+            // the file under the cursor on the whole screen
+            let r = Rect { x: 1, y: area.y + 1, w: w.saturating_sub(2), h: area.h.saturating_sub(2) };
+            self.list_rects = [Rect { x: 0, y: 0, w: 0, h: 0 }; 2];
+            self.draw_preview(&mut cv, &l, r);
+        } else if self.zoom {
+            // the active panel alone, the whole width; the other one is not drawn
+            let r = Rect { x: 1, y: area.y + 1, w: w.saturating_sub(2), h: area.h.saturating_sub(2) };
+            self.list_rects[1 - self.active] = Rect { x: 0, y: 0, w: 0, h: 0 };
+            self.draw_panel(&mut cv, &l, self.active, r);
+        } else {
+            // the separator between the two halves, as lfz draws it between its list and preview
+            for y in area.y..area.y + area.h {
+                cv.put(mid, y, "│", l.border, mid + 1);
+            }
+            let halves = [
+                Rect { x: 1, y: area.y + 1, w: mid.saturating_sub(2), h: area.h.saturating_sub(2) },
+                Rect { x: mid + 2, y: area.y + 1, w: w.saturating_sub(mid + 3), h: area.h.saturating_sub(2) },
+            ];
+            for (i, &r) in halves.iter().enumerate() {
+                if self.quick && i != self.active {
+                    self.list_rects[i] = Rect { x: 0, y: 0, w: 0, h: 0 };
+                    self.draw_preview(&mut cv, &l, r);
+                } else {
+                    self.draw_panel(&mut cv, &l, i, r);
+                }
             }
         }
         self.draw_footer(&mut cv, &l, h - 1, w);
-        if self.chord && self.chord_hints {
-            self.draw_chords(&mut cv, &l, h - 1, w);
-        }
         if let Some(t) = &self.toast {
             let st = if t.error { l.marker } else { l.count };
             let text = format!(" {} ", t.text);
@@ -3082,15 +5374,17 @@ impl App {
     /// The title bar: what the active panel is (upper case, as lfz titles its finder), and on the right
     /// its counter — or the running operation's progress.
     fn draw_title(&self, cv: &mut Canvas, l: &Look, w: u16) {
-        cv.fill(Rect { x: 0, y: 0, w, h: 1 }, l.title);
+        // on a remote the bar is red: this is another machine
+        let bar = if self.p().remote().is_some() { red_bar(l) } else { l.title };
+        cv.fill(Rect { x: 0, y: 0, w, h: 1 }, bar);
         let p = self.p();
-        let what = if p.is_trash() { "TRASH".to_string() } else { "FILES".to_string() };
+        let what = if self.visual.is_some() { "VISUAL".to_string() } else if p.is_trash() { "TRASH".to_string() } else if p.remote().is_some() { if p.loading { "REMOTE …".to_string() } else { "REMOTE".to_string() } } else { "FILES".to_string() };
         let title = if p.query.is_empty() {
             format!(" {what} ")
         } else {
             format!(" {what}: {} ", p.query.to_uppercase())
         };
-        let right = match &self.job {
+        let right = match self.jobs.last() {
             Some(rj) => {
                 let pct = if rj.total > 0 { rj.done * 100 / rj.total.max(1) } else { 0 };
                 let spin = SPIN[(rj.started.elapsed().as_millis() / 120) as usize % SPIN.len()];
@@ -3099,7 +5393,8 @@ impl App {
                 } else {
                     format!("{} / {}", rj.done, rj.total)
                 };
-                format!(" {spin} {} {pct}% · {size} · {} · Esc cancels ", rj.job.kind.label(), rj.file)
+                let more = if self.jobs.len() > 1 { format!(" (+{} more · o t)", self.jobs.len() - 1) } else { String::new() };
+                format!(" {spin} {} {pct}% · {size} · {}{more} · Esc cancels ", rj.job.kind.label(), rj.file)
             }
             None => {
                 let mut s = if p.query.is_empty() {
@@ -3114,7 +5409,21 @@ impl App {
             }
         };
         let rw = str_width(&right) as u16;
-        let mut x = cv.put(0, 0, &truncate(&title, w.saturating_sub(rw + 1) as usize), l.title, w);
+        let mut x = cv.put(0, 0, &truncate(&title, w.saturating_sub(rw + 1) as usize), title_word(l, &bar), w);
+        // zoom mode (vz): said on the bar, in the yellow of the current tab, so it is never a mystery why one panel has the screen
+        // the modes that change what the panels show are said on the bar: zoom, the viewer (vf), the quick view (vv)
+        let modes: Vec<&str> = [(self.zoom, " ZOOM "), (self.viewer, " VIEW "), (self.quick && !self.viewer && !self.zoom, " PREVIEW ")]
+            .iter()
+            .filter(|(on, _)| *on)
+            .map(|(_, w)| *w)
+            .collect();
+        for word in modes {
+            let mut a = l.footer_label.attrs;
+            a.set(crossterm::style::Attribute::Bold);
+            let zoom = Style { attrs: crossterm::style::Attributes::from(a), ..l.footer_label };
+            x = hairline(cv, x, 0, bar.bg, &zoom, w.saturating_sub(rw + 1));
+            x = cv.put(x, 0, word, zoom, w.saturating_sub(rw + 1));
+        }
         // the tabs, when there are several: number and the active panel's directory, the current one lit
         let mut btns = self.tab_btns.borrow_mut();
         btns.clear();
@@ -3131,126 +5440,188 @@ impl App {
                     (None, None) => "trash".into(),
                 };
                 let text = format!(" {} {} ", i + 1, truncate(&name, 16));
-                let st = if i == self.tab { l.footer_key } else { l.footer_label };
-                x = cv.put(x, 0, " ", l.title, lim);
+                // on a remote the tabs that are not this one are red too (the bar is)
+                let mut st = if i == self.tab { l.footer_label } else if self.p().remote().is_some() { red_chip(l) } else { l.footer_key };
+                // the chip the focus is on: lit like a chosen button of the bottom bar (the bar's hue turned over, full background), whatever
+                // tab it is, so it is seen moving along the bar (the current tab keeps its yellow when the focus is not there)
+                if self.tab_focus == Some(i) {
+                    st = title_word(l, &bar);
+                }
+                // the gap between the chips: a hairline in the bar's own colour (red on a remote)
+                x = hairline(cv, x, 0, bar.bg, &st, lim);
                 let x0 = x;
                 x = cv.put(x, 0, &text, st, lim);
                 btns.push((x0, x, i));
             }
         }
-        cv.put(w.saturating_sub(rw), 0, &right, l.counter, w);
+        cv.put(w.saturating_sub(rw), 0, &right, if self.p().remote().is_some() { bar } else { l.counter }, w);
     }
 
-    /// The button bar, centred: " key " + " label ", one space apart (lfz / lvim-picker).
-    /// After Ctrl-c: the commands it leads to, as Neovim's key helper — buttons in rows over the bottom,
-    /// ending on the footer's row.
-    fn draw_chords(&self, cv: &mut Canvas, l: &Look, bottom: u16, w: u16) {
-        let place = if self.p().is_trash() { 2 } else { 1 };
-        let mut items: Vec<(String, String)> = CHORDS
-            .iter()
-            .filter(|(_, _, p, _)| *p == 0 || *p == place)
-            .map(|(k, lab, _, name)| {
-                // `[keys]` may have moved the command
-                let moved = self.cmdkeys.iter().find(|(n, u, c)| n == name && u != c).map(|(_, u, _)| key_label(&u.text));
-                (moved.map(|m| m.trim_start_matches("C-c ").to_string()).unwrap_or_else(|| k.to_string()), lab.to_string())
-            })
-            .collect();
-        for a in &self.actions {
-            if let Some(k) = &a.key
-                && k.chord
-            {
-                items.push((k.text.trim_start_matches("C-c ").to_string(), a.title.clone()));
+    /// The buttons of the bottom bar: (key, label, the key a press sends). The key groups and the single keys; after
+    /// a group's letter, that group's keys.
+    fn footer_keys(&self) -> Vec<(String, String, char)> {
+        let label = |name: &str| -> String {
+            match name {
+                "view" => "quick view".into(),
+                "top" => "top".into(),
+                "trash" => if self.cfg.delete == Delete::Trash { "trash".into() } else { "delete".into() },
+                "delete" => "erase".into(),
+                _ => CHORDS.iter().find(|(_, _, _, n)| *n == name).map(|(_, lab, _, _)| lab.to_string()).unwrap_or_else(|| name.to_string()),
+            }
+        };
+        let mut items: Vec<(String, String, char)> = Vec::new();
+        // the viewer has its own buttons; what cannot be done with this file now is not offered
+        if self.viewer {
+            let pages = self.viewer_positions();
+            for (k, lab, c) in [("j", "line down", 'j'), ("k", "line up", 'k'), ("Space", "page down", ' '), ("b", "page up", 'b'), ("g", "top", 'g'), ("G", "end", 'G')] {
+                items.push((k.into(), lab.into(), c));
+            }
+            if pages > 1 {
+                items.push(("J".into(), "next page".into(), 'J'));
+                items.push(("K".into(), "previous page".into(), 'K'));
+            }
+            items.push(("q".into(), "close".into(), 'q'));
+            return items;
+        }
+        if let Some(g) = self.group {
+            if let Some((_, _, keys)) = GROUPS.iter().find(|(n, _, _)| *n == g) {
+                let place = if self.p().is_trash() { 2 } else { 1 };
+                let mut seen: Vec<&str> = Vec::new();
+                for (k, name) in *keys {
+                    // a command with two keys is one button (the first key)
+                    if seen.contains(name) {
+                        continue;
+                    }
+                    // the way back to this machine is only there on a remote
+                    if *name == "local" && self.p().remote().is_none() {
+                        continue;
+                    }
+                    seen.push(name);
+                    let in_fkeys = self.fkeys.iter().any(|(n, _, _)| n == name);
+                    let ok = in_fkeys || *name == "top" || CHORDS.iter().filter(|(_, _, _, n)| n == name).any(|(_, _, p, _)| *p == 0 || *p == place);
+                    if ok {
+                        items.push((k.to_string(), label(name), k.chars().next().unwrap_or(' ')));
+                    }
+                }
+                if g == 't' {
+                    items.push(("1-9".into(), "tab number".into(), '1'));
+                }
+            }
+        } else {
+            for (g, gname, _) in GROUPS {
+                items.push((g.to_string(), gname.to_string(), *g));
             }
         }
-        // a grid of equal cells, as many columns as fit
-        let cell = items.iter().map(|(k, lab)| str_width(k) + str_width(lab) + 5).max().unwrap_or(10) as u16;
-        let cols = (w.saturating_sub(4) / (cell + 1)).max(1);
-        let rows = (items.len() as u16).div_ceil(cols);
-        // the title, a blank row, the keys, a blank row, Esc on the footer's row
-        let top = bottom.saturating_sub(rows + 3);
-        cv.fill(Rect { x: 0, y: top, w, h: rows + 4 }, l.popup);
-        let title = format!(" {} ", self.leader_name);
-        let title = title.as_str();
-        cv.put((w.saturating_sub(str_width(title) as u16)) / 2, top, title, l.title, w);
-        let grid = cols * (cell + 1);
-        let x0 = w.saturating_sub(grid) / 2;
-        for (i, (k, lab)) in items.iter().enumerate() {
-            let (r, c) = (i as u16 / cols, i as u16 % cols);
-            let mut x = x0 + c * (cell + 1);
-            let y = top + 2 + r;
-            let end = x + cell;
-            x = cv.put(x, y, &format!(" {k} "), l.footer_key, end);
-            // the label's background runs to the end of the cell: every button as wide as the widest
-            cv.fill(Rect { x, y, w: end.saturating_sub(x), h: 1 }, l.footer_label);
-            cv.put(x, y, &format!(" {lab} "), l.footer_label, end);
-        }
-        let esc = " Esc  cancel ";
-        cv.put((w.saturating_sub(str_width(esc) as u16)) / 2, bottom, esc, l.count, w);
+        items
     }
 
-    /// The buttons of the bottom bar: (F-key, label).
-    /// The buttons of the bottom bar: (the key now — `[keys]` may have moved it, the label, the action's own
-    /// F-key number).
-    fn footer_keys(&self) -> Vec<(String, &'static str, u8)> {
-        let key = |a: &str| -> (String, u8) {
-            let (_, ks, canon) = self.fkeys.iter().find(|(n, _, _)| *n == a).expect("an F-key action");
-            let n = if let KeyCode::F(n) = canon.code { n } else { 0 };
-            (key_label(&ks.text), n)
-        };
-        let list: Vec<(&str, &'static str)> = if self.p().is_trash() {
-            vec![("help", "help"), ("view", "view"), ("move", "restore"), ("trash", "delete"), ("menu", "menu"), ("quit", "quit")]
-        } else {
-            vec![
-                ("help", "help"),
-                ("view", "view"),
-                ("copy", "copy"),
-                ("rename", "rename"),
-                ("move", "move"),
-                ("edit", "edit"),
-                ("new", "new"),
-                ("trash", if self.cfg.delete == Delete::Trash { "trash" } else { "delete" }),
-                ("menu", "menu"),
-                ("quit", "quit"),
-            ]
-        };
-        list.into_iter()
-            .map(|(a, lab)| {
-                let (k, n) = key(a);
-                (k, lab, n)
-            })
-            .collect()
-    }
-
-    /// The bottom bar: the F-keys as buttons. With the focus on it (Ctrl-j) the chosen one is lit, as the
+    /// The bottom bar: the key groups as buttons. With the focus on it (Ctrl-j) the chosen one is lit, as the
     /// buttons of the lvim Lua plugins; the mouse presses them too.
     fn draw_footer(&mut self, cv: &mut Canvas, l: &Look, y: u16, w: u16) {
         cv.fill(Rect { x: 0, y, w, h: 1 }, l.panel);
+        self.footer_btns.clear();
+        if !self.chord_hints {
+            return;
+        }
         let keys = self.footer_keys();
         if let Some(f) = self.footer_focus {
             self.footer_focus = Some(f.min(keys.len().saturating_sub(1)));
         }
         let lit_key = Style { fg: l.footer_key.bg, bg: l.footer_key.fg, attrs: l.footer_key.attrs, ..l.footer_key };
         let lit_label = Style { fg: l.sel[0].fg, bg: l.sel[0].bg, attrs: l.sel[0].attrs, ..l.footer_label };
-        let total: usize = keys.iter().map(|(k, lab, _)| str_width(k) + str_width(lab) + 4).sum::<usize>()
-            + keys.len().saturating_sub(1);
-        let mut x = if (total as u16) < w { (w - total as u16) / 2 } else { 0 };
-        self.footer_btns.clear();
+        let widths: Vec<usize> = keys.iter().map(|(k, lab, _)| str_width(k) + str_width(lab) + 4).collect();
+        let total: usize = widths.iter().sum::<usize>() + keys.len().saturating_sub(1);
         self.footer_y = y;
-        for (i, (k, lab, n)) in keys.iter().enumerate() {
-            if i > 0 {
-                x = cv.put(x, y, " ", l.panel, w);
+        if (total as u16) < w {
+            // it all fits: centred
+            self.footer_off = 0;
+            let mut x = (w - total as u16) / 2;
+            for (i, (k, lab, n)) in keys.iter().enumerate() {
+                let lit = self.footer_focus == Some(i);
+                if i > 0 {
+                    x = hairline(cv, x, y, l.panel.bg, if lit { &lit_key } else { &l.footer_key }, w);
+                }
+                let x0 = x;
+                x = cv.put(x, y, &format!(" {k} "), if lit { lit_key } else { l.footer_key }, w);
+                x = cv.put(x, y, &format!(" {lab} "), if lit { lit_label } else { l.footer_label }, w);
+                self.footer_btns.push((x0, x, *n));
             }
-            let bw = (str_width(k) + str_width(lab) + 4) as u16;
-            if x + bw > w.saturating_sub(2) && total as u16 >= w {
-                cv.put(w.saturating_sub(2), y, " ❯", l.chevron, w);
+            return;
+        }
+        // longer than the screen: it scrolls (← → in a group, the wheel, a click on the arrows, Ctrl-j and h / l);
+        // the arrows ‹ › show that more is there
+        let room = w.saturating_sub(4) as usize;
+        let fits = |from: usize, to: usize| widths[from..=to].iter().sum::<usize>() + (to - from) <= room;
+        if let Some(f) = self.footer_focus {
+            self.footer_off = self.footer_off.min(f);
+            while !fits(self.footer_off, f) && self.footer_off < f {
+                self.footer_off += 1;
+            }
+        }
+        self.footer_off = self.footer_off.min(keys.len() - 1);
+        // never scroll past the point where the last button is in view
+        while self.footer_off > 0 && fits(self.footer_off - 1, keys.len() - 1) {
+            self.footer_off -= 1;
+        }
+        let mut x = 2u16;
+        let mut last = self.footer_off;
+        for i in self.footer_off..keys.len() {
+            if !fits(self.footer_off, i) {
                 break;
             }
+            last = i;
+        }
+        if self.footer_off > 0 {
+            cv.put(0, y, "‹ ", l.chevron, w);
+            self.footer_btns.push((0, 2, '\u{2039}'));
+        }
+        for i in self.footer_off..=last {
+            let (k, lab, n) = &keys[i];
             let lit = self.footer_focus == Some(i);
+            if i > self.footer_off {
+                x = hairline(cv, x, y, l.panel.bg, if lit { &lit_key } else { &l.footer_key }, w);
+            }
             let x0 = x;
             x = cv.put(x, y, &format!(" {k} "), if lit { lit_key } else { l.footer_key }, w);
             x = cv.put(x, y, &format!(" {lab} "), if lit { lit_label } else { l.footer_label }, w);
             self.footer_btns.push((x0, x, *n));
         }
+        if last + 1 < keys.len() {
+            cv.put(w.saturating_sub(2), y, " ›", l.chevron, w);
+            self.footer_btns.push((w.saturating_sub(2), w, '\u{203a}'));
+        }
+    }
+
+    /// Scroll the bar by `d` buttons.
+    fn footer_scroll(&mut self, d: isize) {
+        let n = self.footer_keys().len();
+        self.footer_off = (self.footer_off as isize + d).clamp(0, n.saturating_sub(1) as isize) as usize;
+    }
+
+    /// The tab bar has the focus (Ctrl-k): h / l (← →, Tab) choose a tab, Enter goes to it, Esc / j / ↓ / Ctrl-j back to the panels,
+    /// Ctrl-k again out of lvc (Zellij).
+    fn tab_key(&mut self, k: KeyEvent) -> std::io::Result<()> {
+        let n = self.tabs.len().max(1);
+        let Some(f) = self.tab_focus else { return Ok(()) };
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        match k.code {
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Tab if !ctrl => self.tab_focus = Some((f + 1) % n),
+            KeyCode::Char('h') | KeyCode::Left | KeyCode::BackTab if !ctrl => self.tab_focus = Some((f + n - 1) % n),
+            KeyCode::Home | KeyCode::Char('0') | KeyCode::Char('^') => self.tab_focus = Some(0),
+            KeyCode::End | KeyCode::Char('$') => self.tab_focus = Some(n - 1),
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                self.tab_focus = None;
+                self.go_tab(f);
+            }
+            // out of lvc, up (Zellij)
+            KeyCode::Char('k') if ctrl => {
+                self.tab_focus = None;
+                crate::mux::move_focus("up");
+            }
+            KeyCode::Esc | KeyCode::Char('j') | KeyCode::Down => self.tab_focus = None,
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Ctrl-j on the bar: h / l (← →, Tab) choose, Enter / Space press, Esc / Ctrl-k / k back to the list.
@@ -3270,15 +5641,29 @@ impl App {
             KeyCode::Enter | KeyCode::Char(' ') => {
                 self.footer_focus = None;
                 if let Some(&(_, _, num)) = self.footer_keys().get(f) {
-                    self.synthetic = true;
-                    self.key(KeyEvent::new(KeyCode::F(num), KeyModifiers::NONE), term)?;
+                    let code = if num == '\u{1b}' { KeyCode::Esc } else { KeyCode::Char(num) };
+                    self.key(KeyEvent::new(code, KeyModifiers::NONE), term)?;
+                    // a button that opened a group of buttons: the focus stays on the bar (on the first of the new ones) — it was pressed,
+                    // not typed; a command that ran leaves the bar
+                    if self.group.is_some() {
+                        self.footer_focus = Some(0);
+                    }
                 }
             }
             // Ctrl-j on the bar: down, out of lvc (Zellij)
             KeyCode::Char('j') if ctrl => {
                 crate::mux::move_focus("down");
             }
-            KeyCode::Esc | KeyCode::Char('k') | KeyCode::Up => self.footer_focus = None,
+            // Esc: a group that was opened closes first (the focus stays on the bar), then the bar is left; k / ↑ leave at once
+            KeyCode::Esc if self.group.is_some() => {
+                self.group = None;
+                self.footer_off = 0;
+                self.footer_focus = Some(0);
+            }
+            KeyCode::Esc | KeyCode::Char('k') | KeyCode::Up => {
+                self.group = None;
+                self.footer_focus = None;
+            }
             KeyCode::Char('q') if ctrl => self.quit = true,
             // an F-key itself still works
             KeyCode::F(_) => {
@@ -3292,33 +5677,36 @@ impl App {
 
     /// The bar over a panel: the directory, drawn as lfz draws the file over its preview (icon, name,
     /// the parent dimmer).
-    fn draw_path_bar(&self, cv: &mut Canvas, l: &Look, r: Rect, path: &Path, icon_override: Option<&str>, reserve: u16) {
-        cv.fill(Rect { x: r.x, y: r.y, w: r.w, h: 1 }, l.file_bar);
+    fn draw_path_bar(&self, cv: &mut Canvas, l: &Look, r: Rect, path: &Path, shown: Option<&Path>, icon_override: Option<&str>, reserve: u16, active: bool) {
+        let (f_bar, f_name, f_dir) = bar_styles(l, active);
+        cv.fill(Rect { x: r.x, y: r.y, w: r.w, h: 1 }, f_bar);
         let limit = (r.x + r.w).saturating_sub(reserve);
-        let name = path
+        // the name shown: an archive's inside reads as `archive.zip/inner/dir`
+        let label = shown.unwrap_or(path);
+        let name = label
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
+            .unwrap_or_else(|| label.display().to_string());
         let image = match icon_override {
             Some(_) => None,
             None => lvim_fuzzy_ui::iconimg::image_id(&path.to_string_lossy(), path.is_dir()),
         };
         let mut x = if let Some(id) = image {
-            let x = cv.put(r.x, r.y, " ", l.file_name, limit);
-            cv.put_image_icon(x, r.y, id, l.file_name.bg, limit)
+            let x = cv.put(r.x, r.y, " ", f_name, limit);
+            cv.put_image_icon(x, r.y, id, f_name.bg, limit)
         } else {
             let (ic, accent) = match icon_override {
                 Some(i) => (i, "blue"),
                 None => lvim_fuzzy_ui::lvim::icon(&path.to_string_lossy(), path.is_dir()),
             };
-            let icon_st = Style { fg: l.theme.color(accent).or(l.file_icon.fg), bg: l.file_name.bg.or(l.file_icon.bg), ..l.file_icon };
+            let icon_st = Style { fg: l.theme.color(accent).or(l.file_icon.fg), bg: f_name.bg.or(l.file_icon.bg), ..l.file_icon };
             cv.put(r.x, r.y, &format!(" {ic}"), icon_st, limit)
         };
-        x = cv.put(x, r.y, &format!(" {name} "), l.file_name, limit);
-        if let Some(parent) = path.parent().filter(|_| path.file_name().is_some()) {
+        x = cv.put(x, r.y, &format!(" {name} "), f_name, limit);
+        if let Some(parent) = label.parent().filter(|_| label.file_name().is_some()) {
             let d = fsx::tilde(parent);
             let d = if d.ends_with('/') { d } else { format!("{d}/") };
-            cv.put(x, r.y, &format!(" {d} "), l.file_dir, limit);
+            cv.put(x, r.y, &format!(" {d} "), f_dir, limit);
         }
     }
 
@@ -3329,18 +5717,51 @@ impl App {
             return;
         }
         let active = i == self.active;
-        // the path bar
+        // the path bar: brighter on the panel you are in
+        let (f_bar, f_name, f_dir) = bar_styles(l, active);
         match self.panels[i].place.clone() {
             Place::Dir(d) => {
                 let p = &self.panels[i];
                 let fw = 2 + p.sort.label().len() as u16 + if p.reverse { 2 } else { 0 } + if p.hidden { 9 } else { 0 };
-                self.draw_path_bar(cv, l, r, &d, None, fw + 1)
+                {
+                    let shown = p.archive.as_ref().and_then(|a| d.strip_prefix(&a.root).ok().map(|rel| a.archive.join(rel)));
+                    self.draw_path_bar(cv, l, r, &d, shown.as_deref(), None, fw + 1, active)
+                }
+            }
+            Place::Remote { remote, path } => {
+                cv.fill(Rect { x: r.x, y: r.y, w: r.w, h: 1 }, f_bar);
+                // an icon before the name: a server for ssh / sftp / ftp / a mount, a cloud for rclone (an image when the images are on)
+                let engine = self.remote.as_ref().and_then(|c| c.config()["remotes"][remote.as_str()]["engine"].as_str().map(str::to_string)).unwrap_or_else(|| "rclone".into());
+                let (img, glyph, accent) = if engine == "rclone" { ("cloud-functions", "\u{f0c2}", "cyan") } else { ("server", "\u{f233}", "blue") };
+                let lim = r.x + r.w;
+                let x = match lvim_fuzzy_ui::iconimg::image_id(img, true) {
+                    Some(id) => {
+                        let x = cv.put(r.x, r.y, " ", f_name, lim);
+                        cv.put_image_icon(x, r.y, id, f_name.bg, lim)
+                    }
+                    None => {
+                        let st = Style { fg: l.theme.color(accent).or(l.file_icon.fg), bg: f_name.bg.or(l.file_icon.bg), ..l.file_icon };
+                        cv.put(r.x, r.y, &format!(" {glyph}"), st, lim)
+                    }
+                };
+                let x = cv.put(x, r.y, &format!(" {remote} "), tint(l, "yellow", f_name, f_name.bg), lim);
+                let shown = if path.is_empty() { "/" } else { path.as_str() };
+                cv.put(x, r.y, &format!(" {shown} "), f_dir, r.x + r.w);
             }
             Place::Trash => {
-                cv.fill(Rect { x: r.x, y: r.y, w: r.w, h: 1 }, l.file_bar);
-                let st = Style { fg: l.theme.color("red").or(l.file_icon.fg), ..l.file_icon };
-                let x = cv.put(r.x, r.y, " 󰩹", st, r.x + r.w);
-                cv.put(x, r.y, " Trash ", l.file_name, r.x + r.w);
+                cv.fill(Rect { x: r.x, y: r.y, w: r.w, h: 1 }, f_bar);
+                // the trash folder's icon, as an image like the directories' (the font glyph when images are off)
+                let x = match lvim_fuzzy_ui::iconimg::image_id("trash", true) {
+                    Some(id) => {
+                        let x = cv.put(r.x, r.y, " ", f_name, r.x + r.w);
+                        cv.put_image_icon(x, r.y, id, f_name.bg, r.x + r.w)
+                    }
+                    None => {
+                        let st = Style { fg: l.theme.color("red").or(l.file_icon.fg), ..l.file_icon };
+                        cv.put(r.x, r.y, " 󰩹", st, r.x + r.w)
+                    }
+                };
+                cv.put(x, r.y, " Trash ", f_name, r.x + r.w);
             }
         }
         // the order and the hidden-files flag, at the right end of the bar
@@ -3354,7 +5775,7 @@ impl App {
             );
             let fw = str_width(&flags) as u16;
             if r.w > fw + 20 {
-                cv.put(r.x + r.w - fw, r.y, &flags, l.file_dir, r.x + r.w);
+                cv.put(r.x + r.w - fw, r.y, &flags, f_dir, r.x + r.w);
             }
         }
         // the prompt: the badge (bright on the active panel), then the field
@@ -3363,7 +5784,8 @@ impl App {
         let searching = active && self.searching;
         let badge_st = if searching { l.prompt } else { Style { bg: l.input.bg, ..l.count } };
         let mut x = cv.put(r.x, py, " Search ", badge_st, r.x + r.w);
-        x = cv.put(x, py, " ", l.panel, r.x + r.w);
+        // the gap between the badge and the field: a hairline
+        x = hairline(cv, x, py, l.panel.bg, &l.input, r.x + r.w);
         let field = Rect { x, y: py, w: (r.x + r.w).saturating_sub(x), h: 1 };
         cv.fill(field, l.input);
         let qx = if p.query.is_empty() {
@@ -3608,14 +6030,24 @@ impl App {
 
     /// The quick view: as lfz's preview — the file bar, then the body.
     fn draw_preview(&mut self, cv: &mut Canvas, l: &Look, r: Rect) {
-        let path = self.p().current_path();
+        let path = self.pcur();
         let Some(path) = path.filter(|p| !p.as_os_str().is_empty()) else {
+            // a remote file that could not be had: why, in the pane
+            if let Some((remote, _)) = self.p().remote().map(|(a, b)| (a.to_string(), b.to_string()))
+                && let Some(e) = self.p().current().cloned().filter(|e| !e.is_parent() && !e.is_dir())
+                && let Some(rpath) = self.p().remote_path_of(&e)
+                && let Some(why) = self.fetch_failed.get(&lvim_fuzzy_plugin_remote::engine::cache_file(&remote, &rpath, e.size, e.mtime))
+                && r.h >= 3
+            {
+                cv.put(r.x + 1, r.y + 1, "no preview: the file could not be downloaded", l.marker, r.x + r.w);
+                cv.put(r.x + 1, r.y + 2, &truncate(why, r.w.saturating_sub(2) as usize), l.panel, r.x + r.w);
+            }
             return;
         };
         if r.h < 3 || r.w < 8 {
             return;
         }
-        self.draw_path_bar(cv, l, r, &path, None, 0);
+        self.draw_path_bar(cv, l, r, &path, None, None, 0, false);
         let inner = Rect { x: r.x, y: r.y + 1, w: r.w, h: r.h - 1 };
         let ps = path.to_string_lossy().into_owned();
         let name = path
@@ -3827,6 +6259,117 @@ impl App {
         let Some(d) = &self.dialog else { return };
         let text = Style { bg: l.popup.bg, ..l.popup };
         match d {
+            Dialog::Connections { rows, sel } => {
+                let nw = rows.iter().map(|r| str_width(&r.name)).max().unwrap_or(8).max(8);
+                let line = |r: &ConnRow| format!(" {:<nw$}  {:<7}  {}", r.name, r.engine, r.detail);
+                let pw = rows.iter().map(|r| str_width(&line(r)) as u16).max().unwrap_or(40).max(52) + 8;
+                let r0 = self.popup(cv, l, (w, h), (pw, rows.len() as u16 + 4), "Remote connections");
+                let lim = r0.x + r0.w;
+                let green = Style { fg: l.theme.color("green").or(text.fg), ..text };
+                for (i, r) in rows.iter().enumerate() {
+                    let y = r0.y + i as u16;
+                    let on = self.remote_connected(&r.name);
+                    let st = if i == *sel { l.sel[0] } else { text };
+                    cv.fill(Rect { x: r0.x, y, w: r0.w, h: 1 }, st);
+                    let dot = if i == *sel { st } else if on { green } else { Style { bg: text.bg, ..l.count } };
+                    // one space of air before the dot, and after it
+                    cv.put(r0.x + 1, y, if on { "●" } else { "○" }, dot, lim);
+                    cv.put(r0.x + 2, y, &line(r), st, lim);
+                }
+                let on = rows.get(*sel).is_some_and(|r| self.remote_connected(&r.name));
+                hints(cv, l, r0.x, r0.y + rows.len() as u16 + 1, lim, &[("Enter", if on { "disconnect" } else { "connect" }), ("j/k", "move"), ("Esc", "close")]);
+            }
+            Dialog::Site { name, locked, ty, vals, focus, open, note, .. } => {
+                let fields = site_fields(*ty);
+                let title = if *locked { format!("Connection · {name}") } else { "New connection".to_string() };
+                let r = self.popup(cv, l, (w, h), (84, fields.len() as u16 + 9), &title);
+                let lim = r.x + r.w;
+                let fx = r.x + 14;
+                let fw = lim.saturating_sub(fx);
+                let label = Style { fg: l.theme.color("blue").or(text.fg), ..text };
+                let row = |cv: &mut Canvas, i: usize, lab: &str, val: &str, hint: &str, edit: bool| {
+                    let y = r.y + i as u16;
+                    cv.put(r.x, y, lab, label, lim);
+                    let st = if *focus == i { l.sel[0] } else { l.input };
+                    cv.fill(Rect { x: fx, y, w: fw, h: 1 }, st);
+                    let rev = Style { attrs: crossterm::style::Attributes::from(Attribute::Reverse), ..st };
+                    if val.is_empty() && !hint.is_empty() {
+                        // the hint is the same colour whether the row is chosen or not; the cursor stands BEFORE it
+                        if *focus == i && edit {
+                            cv.put(fx + 1, y, " ", rev, lim);
+                            cv.put(fx + 2, y, hint, Style { bg: st.bg, ..l.count }, lim.saturating_sub(1));
+                        } else {
+                            cv.put(fx + 1, y, hint, Style { bg: st.bg, ..l.count }, lim.saturating_sub(1));
+                        }
+                        return;
+                    }
+                    let x = cv.put(fx + 1, y, val, st, lim.saturating_sub(1));
+                    if *focus == i && edit {
+                        cv.put(x, y, " ", rev, lim);
+                    }
+                };
+                row(cv, 0, "Name", name, if *locked { "" } else { "letters, digits, - _ . @" }, !*locked);
+                let kind = format!("{}   ‹ ›", SITE_TYPES[*ty].0);
+                row(cv, 1, "Kind", &kind, "", false);
+                for (i, f) in fields.iter().enumerate() {
+                    let marker = if f.pick != Pick::None { " ▾" } else { "" };
+                    row(cv, 2 + i, &format!("{}{}", f.label, marker), vals.get(f.key).map(String::as_str).unwrap_or(""), f.hint, true);
+                }
+                let by = r.y + 3 + fields.len() as u16;
+                let lit_key = Style { fg: l.footer_key.bg, bg: l.footer_key.fg, ..l.footer_key };
+                let (ok_i, cancel_i) = (2 + fields.len(), 3 + fields.len());
+                let bx = r.x + (r.w.saturating_sub(20)) / 2;
+                let x = cv.put(bx, by, "   OK   ", if *focus == ok_i { lit_key } else { l.footer_key }, lim);
+                let x = cv.put(x, by, "  ", text, lim);
+                cv.put(x, by, " Cancel ", if *focus == cancel_i { lit_key } else { l.footer_key }, lim);
+                hints(cv, l, r.x, by + 1, lim, &[("Tab", "next"), ("Enter", "choose"), ("Esc", "cancel")]);
+                if note.is_empty() {
+                    cv.put(r.x, by + 2, "No password is written: it is asked for when the server wants it.", Style { bg: l.popup.bg, ..l.count }, lim);
+                } else {
+                    cv.put(r.x, by + 2, note, Style { fg: l.theme.color("red").or(text.fg), bg: l.popup.bg, ..text }, lim);
+                }
+                // the open drop-down, over what is below its row
+                if let Some(list) = open {
+                    let m = list.matches();
+                    let y0 = r.y + *focus as u16 + 1;
+                    let rows = (m.len() as u16).clamp(1, 8);
+                    let bx = Rect { x: fx, y: y0, w: fw, h: rows + 1 };
+                    cv.fill(bx, l.popup_border);
+                    let qline = if list.query.is_empty() { "type to filter".to_string() } else { format!("› {}", list.query) };
+                    cv.put(fx + 1, y0, &qline, Style { bg: l.popup_border.bg, ..l.count }, lim);
+                    let start = list.sel.saturating_sub(rows as usize - 1);
+                    for (n, &i) in m.iter().enumerate().skip(start).take(rows as usize) {
+                        let y = y0 + 1 + (n - start) as u16;
+                        let st = if n == list.sel { l.sel[0] } else { l.rows[n % 2] };
+                        cv.fill(Rect { x: fx, y, w: fw, h: 1 }, st);
+                        cv.put(fx + 1, y, &list.items[i].0, st, lim.saturating_sub(1));
+                    }
+                    if m.is_empty() {
+                        cv.put(fx + 1, y0 + 1, "(no match)", Style { bg: l.popup_border.bg, ..l.count }, lim);
+                    }
+                }
+            }
+            Dialog::Tasks { sel } => {
+                let rows: Vec<String> = self
+                    .jobs
+                    .iter()
+                    .map(|rj| {
+                        let pct = if rj.total > 0 { rj.done * 100 / rj.total.max(1) } else { 0 };
+                        let secs = rj.started.elapsed().as_secs();
+                        format!("{:<9} {:>3}%  {:>5}s  {}", rj.job.kind.label(), pct, secs, rj.file)
+                    })
+                    .collect();
+                let lw = rows.iter().map(|r| str_width(r)).max().unwrap_or(20).max(36) as u16;
+                let r = self.popup(cv, l, (w, h), (lw + 4, rows.len() as u16 + 4), "Operations");
+                let lim = r.x + r.w;
+                for (i, row) in rows.iter().enumerate() {
+                    let y = r.y + i as u16;
+                    let st = if i == *sel { l.sel[0] } else { text };
+                    cv.fill(Rect { x: r.x, y, w: r.w, h: 1 }, st);
+                    cv.put(r.x + 1, y, row, st, lim);
+                }
+                hints(cv, l, r.x, r.y + rows.len() as u16 + 1, lim, &[("x", "cancel"), ("j/k", "move"), ("Esc", "close")]);
+            }
             Dialog::Columns { sel } => {
                 let all = crate::config::Cols::ALL;
                 let lw = all.iter().map(|(_, lab)| str_width(lab)).max().unwrap_or(10) as u16;
@@ -3854,13 +6397,13 @@ impl App {
                 }
                 hints(cv, l, r.x, r.y + all.len() as u16 + 1, lim, &[("Space", "tick"), ("j/k", "move"), ("Esc", "close")]);
             }
-            Dialog::Owner { paths, users, groups, user, group, focus, open } => {
+            Dialog::Owner { paths, users, groups, user, group, members, focus, open, .. } => {
                 let title = format!("Owner · {} item(s)", paths.len());
                 let r = self.popup(cv, l, (w, h), (48, 7), &title);
                 let lim = r.x + r.w;
                 let fx = r.x + 8;
                 let fw = lim.saturating_sub(fx);
-                for (row, (lab, name)) in [("User", &users[*user]), ("Group", &groups[*group])].iter().enumerate() {
+                for (row, (lab, name)) in [("Group", &groups[*group]), ("User", &users[*user])].iter().enumerate() {
                     let y = r.y + row as u16 * 2;
                     cv.put(r.x, y, lab, text, lim);
                     let st = if *focus == row { l.sel[0] } else { l.input };
@@ -3879,9 +6422,10 @@ impl App {
                 cv.put(x, by, " Cancel ", cancel, lim);
                 // the open drop-down, over what is below its field
                 if let Some((q, sel)) = open {
-                    let names = if *focus == 0 { users } else { groups };
+                    let names = if *focus == 0 { groups } else { users };
                     let ql = q.to_lowercase();
-                    let m: Vec<&String> = names.iter().filter(|n| n.to_lowercase().contains(&ql)).collect();
+                    let m: Vec<&String> =
+                        names.iter().filter(|n| n.to_lowercase().contains(&ql) && (*focus == 0 || members.contains(n))).collect();
                     let y0 = r.y + *focus as u16 * 2 + 1;
                     let rows = (m.len() as u16).clamp(1, 10);
                     let bx = Rect { x: fx, y: y0, w: fw, h: rows + 1 };
@@ -3900,7 +6444,7 @@ impl App {
                     }
                 }
             }
-            Dialog::Mode { paths, value, cur, base, is_dir, bits, focus } => {
+            Dialog::Mode { paths, value, cur, base, is_dir, bits, focus, .. } => {
                 let title = format!("Permissions · {} item(s)", paths.len());
                 let r = self.popup(cv, l, (w, h), (56, 11), &title);
                 let lim = r.x + r.w;
@@ -3971,13 +6515,58 @@ impl App {
                 }
                 hints(cv, l, r.x, r.y + 8, lim, &[("Enter", "ok"), ("Tab", "switch"), ("Space", "tick"), ("Esc", "cancel")]);
             }
-            Dialog::Input { title, value, cur, .. } => {
+            Dialog::Input { value, cur, action: InputAction::Shell, .. } => {
+                // the command line: one row over the button bar, `dir $ command`
+                let y = h.saturating_sub(2);
+                cv.fill(Rect { x: 0, y, w, h: 1 }, l.input);
+                let dir = self.p().dir().map(fsx::tilde).unwrap_or_default();
+                let prompt = format!(" {} $ ", truncate(&dir, (w / 3) as usize));
+                let px = cv.put(0, y, &prompt, tint(l, "green", l.input, l.input.bg), w);
+                let chars: Vec<char> = value.chars().collect();
+                let room = w.saturating_sub(px + 1) as usize;
+                let start = cur.saturating_sub(room.saturating_sub(1));
+                let mut x = px;
+                for (i, ch) in chars.iter().enumerate().skip(start) {
+                    let st = if i == *cur { Style { attrs: crossterm::style::Attributes::from(Attribute::Reverse), ..l.input } } else { l.input };
+                    let mut b = [0u8; 4];
+                    x = cv.put(x, y, ch.encode_utf8(&mut b), st, w);
+                }
+                if *cur >= chars.len() {
+                    cv.put(x, y, " ", Style { attrs: crossterm::style::Attributes::from(Attribute::Reverse), ..l.input }, w);
+                }
+                // what Tab offers, on the row above, the chosen one lit; it scrolls to keep that one in view
+                if let Some(c) = &self.comp
+                    && y > 0
+                {
+                    let names: Vec<String> = c.cands.iter().map(|n| n.rsplit('/').find(|s| !s.is_empty()).map(|s| if n.ends_with('/') { format!("{s}/") } else { s.to_string() }).unwrap_or_else(|| n.clone())).collect();
+                    let widths: Vec<usize> = names.iter().map(|n| str_width(n) + 2).collect();
+                    let chosen = c.idx.unwrap_or(0);
+                    let room = w.saturating_sub(2) as usize;
+                    let mut from = 0;
+                    while from < chosen && widths[from..=chosen].iter().sum::<usize>() > room {
+                        from += 1;
+                    }
+                    cv.fill(Rect { x: 0, y: y - 1, w, h: 1 }, l.popup);
+                    let mut x = 1;
+                    for (i, n) in names.iter().enumerate().skip(from) {
+                        if x as usize + widths[i] > w as usize {
+                            break;
+                        }
+                        let st = if c.idx == Some(i) { l.sel[0] } else { l.footer_label };
+                        x = cv.put(x, y - 1, &format!(" {n} "), st, w);
+                        x += 0;
+                    }
+                }
+            }
+            Dialog::Input { title, value, cur, action } => {
+                // a password is shown as dots
+                let masked = matches!(action, InputAction::RemotePassword { .. });
                 let pw = (w * 2 / 3).max(40);
                 let r = self.popup(cv, l, (w, h), (pw, 5), title);
                 let field = Rect { x: r.x, y: r.y, w: r.w, h: 1 };
                 cv.fill(field, l.input);
                 // the end of a long value stays visible
-                let chars: Vec<char> = value.chars().collect();
+                let chars: Vec<char> = if masked { value.chars().map(|_| '•').collect() } else { value.chars().collect() };
                 let start = cur.saturating_sub(field.w as usize - 1);
                 let mut x = field.x;
                 for (i, ch) in chars.iter().enumerate().skip(start) {
@@ -4019,6 +6608,23 @@ impl App {
                 }
                 hints(cv, l, r.x, r.y + n as u16 + 1, r.x + r.w, &[("j/k", "move"), ("Enter", "pick"), ("Esc", "close")]);
             }
+            Dialog::Info { title, rows } => {
+                let vw = |r: &InfoRow| r.value.iter().map(|(t, _)| str_width(t)).sum::<usize>();
+                let pw = rows.iter().map(|r| vw(r)).max().unwrap_or(20).max(30) as u16 + 14;
+                let r = self.popup(cv, l, (w, h), (pw, rows.len() as u16 + 4), title);
+                let lim = r.x + r.w;
+                for (i, row) in rows.iter().enumerate() {
+                    let y = r.y + i as u16;
+                    // every label in the one colour: blue
+                    let lc = "blue";
+                    cv.put(r.x, y, row.label, tint(l, lc, text, text.bg), lim);
+                    let mut x = r.x + 10;
+                    for (t, colour) in &row.value {
+                        x = if *colour == "mode" { put_mode(cv, l, x, y, t, text, lim) } else { cv.put(x, y, t, tint(l, colour, text, text.bg), lim) };
+                    }
+                }
+                hints(cv, l, r.x, r.y + rows.len() as u16 + 1, lim, &[("any key", "close")]);
+            }
             Dialog::Message { title, lines } => {
                 let pw = lines.iter().map(|s| str_width(s) as u16).max().unwrap_or(20).max(30) + 6;
                 let n = lines.len().min(h as usize - 7);
@@ -4031,24 +6637,26 @@ impl App {
         }
     }
 
-    /// A key as shown: the leader chord names the real leader (`C-c x` → `C-a x`).
+    /// A key as shown (a group's keys, `t n`, are shown as they are).
     fn show_key(&self, text: &str) -> String {
-        match text.strip_prefix("C-c ") {
-            Some(rest) => format!("{} {rest}", self.leader_label),
-            None => key_label(text),
-        }
+        if text.contains(' ') { text.to_string() } else { key_label(text) }
+    }
+
+    /// Where a command sits in the key groups (`t n`).
+    fn seq_of(name: &str) -> Option<String> {
+        GROUPS.iter().find_map(|(g, _, keys)| keys.iter().find(|(_, n)| *n == name).map(|(k, _)| format!("{g} {k}")))
     }
 
     /// The help's rows: the built-in keys, then the user actions that have a key.
     fn help_items(&self) -> Vec<(String, String)> {
         let mut v: Vec<(String, String)> = HELP_KEYS
             .iter()
-            .map(|(k, d)| (k.replace("Ctrl-c", &self.leader_name), d.replace("Ctrl-c", &self.leader_name)))
+            .map(|(k, d)| (k.to_string(), d.to_string()))
             .collect();
         // the commands `[keys]` moved
         for (n, u, c) in &self.cmdkeys {
             if u != c {
-                v.push((self.show_key(&u.text), format!("{n} (moved from {})", self.show_key(&c.text))));
+                v.push((self.show_key(&u.text), format!("{n} (moved from {})", Self::seq_of(n).unwrap_or_else(|| self.show_key(&c.text)))));
             }
         }
         for a in &self.actions {
@@ -4098,52 +6706,32 @@ impl App {
 const HELP_KEYS: &[(&str, &str)] = &[
         ("Tab · Ctrl-h · Ctrl-l", "the other panel · the left · the right"),
         ("j k · gg G · ↑ ↓ PgUp PgDn Home End", "move · top / bottom"),
-        ("l · Enter · →", "enter a directory · open a file"),
+        ("l · Enter · →", "enter a directory or an archive (unpacked into the cache; h at its top comes out) · open a file"),
         ("h · Backspace · ←", "up one directory"),
         ("Ctrl-f · /", "input mode: typing filters (fuzzy); Enter / Esc back"),
         ("Space · Insert", "mark and move down"),
+        ("V", "visual mode: the rows from here to the cursor are marked as you move; Esc or V ends it (the marks stay)"),
         (".", "hidden files"),
         ("J · K", "the quick view: next / previous page (PDF, documents) or point of a video; else scroll 3 lines"),
         ("Ctrl-e · Ctrl-y", "scroll the quick view one line"),
         ("Esc", "clear the query, then the marks"),
-        ("F1", "this help"),
-        ("F2", "quick view"),
-        ("F3", "copy (to the other panel)"),
-        ("F4", "rename (several marked: all of them in the editor)"),
-        ("F5", "move (to the other panel)"),
-        ("F6", "edit (a directory too: the editor opens it)"),
-        ("F7", "new: a file, or a directory when the name ends in /"),
-        ("F8 · Delete", "to the trash (config: delete = \"direct\")"),
-        ("Shift-F8", "delete for good"),
-        ("F9", "the menu"),
-        ("F10 · Ctrl-q", "quit"),
+        ("o …", "operations: c copy · m move (to the other panel; the target can be edited and end in a rename mask: *.md = the name without its last extension + .md, old_** = old_ + the whole name) · r refresh · R rename the tab · N rename (several marked: all in the editor) · n new (a directory when the name ends in /) · e edit · d trash · D delete for good · o the menu · t the running operations (they run side by side; x cancels one)"),
+        ("Delete", "to the trash (config: delete = \"direct\")"),
+        ("Ctrl-q", "quit"),
         ("Ctrl-j", "onto the F-key buttons: h / l choose, Enter presses, Ctrl-k / Esc back"),
-        ("Ctrl-c …", "every other command: Ctrl-c, then a key (the bar shows them)"),
-        ("Ctrl-c f · g", "find files · grep (lvim-fuzzy)"),
-        ("Ctrl-c c · b", "go to a directory · bookmarks and recent"),
-        ("Ctrl-c x", "run a shell command here"),
-        ("Ctrl-c t", "the trash (there: F5 or r restore, F8 delete, e empty)"),
-        ("Ctrl-c m", "permissions: ticks, or 755 / u+x,g-w,o=r in the field (each follows the other)"),
-        ("Ctrl-c O", "owner and group: drop-downs of the real users and groups"),
-        ("Ctrl-c z · e", "compress the marked · extract"),
-        ("Ctrl-c u", "undo the last operation"),
-        ("Ctrl-c a · * · + · -", "mark all · invert · mark / unmark by glob"),
-        ("Ctrl-c h · l · s · S", "hidden files · long view (perms, owner, group) · sort · reverse"),
-        ("Ctrl-c n · w", "a new tab (on the same directories) · close this tab"),
-        ("Ctrl-c , · < · >", "rename this tab (empty: its directory's name) · move it left · right"),
-        ("gt · gT · g1…g9", "the next / previous tab · that tab (a click on its name: go · middle click: close · right click: rename)"),
-        ("Ctrl-c I", "the other running lvc: go to its directory, bring it here, copy / move to it"),
-        ("Ctrl-c y · Y · D", "copy the path(s) · the name(s) · the panel's directory (clipboard)"),
-        ("Ctrl-c L", "symbolic links to the marked in the other panel (Tab: absolute / relative)"),
-        ("Ctrl-c v", "the columns: type, permissions, owner, group, size, date — each on / off"),
-        ("Ctrl-c p", "swap the panels"),
-        ("Ctrl-c o · i", "the dir under the cursor / this one → other panel"),
-        ("Ctrl-c [ · ]", "back / forward in the history"),
+        ("t …", "tabs: N new · n / p next / previous · d close · e rename · < > move · i other lvc · 1-9 go to"),
+        ("m …", "marks: a all · * invert · + / - mark / unmark by glob"),
+        ("a …", "actions: z compress · e extract · m mode · o owner · L symlinks · x run a command in the shell (also `:`: the command line over the buttons; Tab completes, Up / Down recall) · u undo · s the shell under the panels (also Ctrl-o; Ctrl-o again comes back) · r restore (trash) · q quit"),
+        ("y …", "yank: y copy the files to the buffer · x cut them · p path(s) · n name(s) · d the panel's directory (text, to the clipboard)"),
+        ("p …", "paste the buffer: p here · o other panel · c as copies · r with a new name / mask · l symbolic links · h hard links · m the clipboard's paths · v what is in it · d empty it"),
+        ("f …", "find: f files · g grep (lvim-fuzzy)"),
+        ("g …", "go: gg top · G back to this machine from a remote · c directory · b bookmarks · t the trash · [ ] back / forward · o i dir → other panel · ? this help (the bar scrolls with ← → when it is longer than the screen)"),
+        ("r …", "remote connections: c / l the list — Enter connects, or disconnects a connected one · a new (a form) · e change · d delete; a remote is left by disconnecting, not by h / Backspace; its title bar is red; on a remote panel the keys are the usual ones (oc om on oN od …)"),
+        ("v …", "view: v quick view · i info · d compare the panels · b synchronized browsing · c columns · l long · h hidden · s sort · S reverse · w swap panels · r reload · H hints"),
+        ("hjkl · / · Space · .", "move · search · mark · hidden files"),
         ("Ctrl-d · Ctrl-u", "half a page down / up (the quick view when it is open)"),
-        ("Ctrl-c r", "reload"),
-        ("Ctrl-c 1 … 0", "F1 … F10 (when the terminal keeps the F-keys)"),
-        ("Ctrl-c H", "show / hide the bar of the Ctrl-c commands"),
-        ("Ctrl-c q", "quit"),
+        ("u · R", "undo the last operation · redo what was undone (vi)"),
+        ("Esc", "leave a group; clear the query, then the marks"),
     ];
 
 
@@ -4213,6 +6801,8 @@ struct TabState {
     panels: [Panel; 2],
     active: usize,
     quick: bool,
+    zoom: bool,
+    viewer: bool,
 }
 
 type DirCounts = std::cell::RefCell<std::collections::HashMap<PathBuf, (i64, usize)>>;
@@ -4276,6 +6866,27 @@ fn key_label(text: &str) -> String {
     out
 }
 
+/// Where unpacked archives live while they are entered.
+pub fn arc_cache() -> PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| fsx::home().join(".cache"))
+        .join("lvim-commander/arc")
+}
+
+/// Unpacked archives not used for two weeks go (a thread at start).
+pub fn prune_arcs() {
+    let Ok(rd) = std::fs::read_dir(arc_cache()) else { return };
+    let limit = std::time::Duration::from_secs(14 * 86_400);
+    for e in rd.flatten() {
+        let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > limit);
+        if old && e.path().starts_with(arc_cache()) {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
 /// How old a time is, as a colour: today green, this week teal, this month blue, this year purple, older
 /// dim.
 fn age_colour(t: i64) -> &'static str {
@@ -4289,6 +6900,66 @@ fn age_colour(t: i64) -> &'static str {
         d if d < 31 * 86_400 => "blue",
         d if d < 365 * 86_400 => "purple",
         _ => "comment",
+    }
+}
+
+/// The path bar's three styles (the bar, the name's chip, the directory); on the active panel the whole bar takes the icon's background.
+fn bar_styles(l: &Look, active: bool) -> (Style, Style, Style) {
+    use crossterm::style::{Attribute, Attributes};
+    if !active {
+        return (l.file_bar, l.file_name, l.file_dir);
+    }
+    // the active panel: the background under the icon (the name's chip) becomes the background of the whole bar, so the icon, the name, the
+    // path and the info at the right end stand on one tone; the path and the info in bold
+    let mut a = l.file_dir.attrs;
+    a.set(Attribute::Bold);
+    let bar = Style { bg: l.file_name.bg.or(l.file_bar.bg), ..l.file_bar };
+    let dir = Style { bg: l.file_name.bg.or(l.file_dir.bg), attrs: Attributes::from(a), ..l.file_dir };
+    (bar, l.file_name, dir)
+}
+
+/// The word at the left of the title bar (FILES, REMOTE …): lit like a chosen button of the bottom bar (full background, the colours turned
+/// over), in the bar's own hue.
+fn title_word(_l: &Look, bar: &Style) -> Style {
+    use crossterm::style::{Attribute, Attributes};
+    let mut a = bar.attrs;
+    a.set(Attribute::Bold);
+    // as a chosen button of the bottom bar: the bar's colour is the background now, the bar's own background the text
+    // (a terminal palette that puts both on the same colour gets black text)
+    let fg = if bar.bg == bar.fg { Some(crossterm::style::Color::Black) } else { bar.bg };
+    Style { fg, bg: bar.fg, attrs: Attributes::from(a), ..*bar }
+}
+
+/// The gap between two buttons of a bar as thin as a cell allows: a one-eighth block in the bar's colour over the next button's own,
+/// so what is seen is a hairline, not a blank cell. Returns the x after it.
+fn hairline(cv: &mut Canvas, x: u16, y: u16, bar_bg: Option<crossterm::style::Color>, next: &Style, limit: u16) -> u16 {
+    cv.put(x, y, "▏", Style { fg: bar_bg, bg: next.bg, ..*next }, limit)
+}
+
+/// The title bar on a remote: the theme's red, a dark red behind it.
+fn red_bar(l: &Look) -> Style {
+    use crossterm::style::Color;
+    match l.theme.color("red") {
+        // a true colour: the red on a dark red
+        Some(Color::Rgb { r, g, b }) => {
+            let dark = Color::Rgb { r: (r as f32 * 0.32) as u8, g: (g as f32 * 0.32) as u8, b: (b as f32 * 0.32) as u8 };
+            Style { fg: Some(Color::Rgb { r, g, b }), bg: Some(dark), ..l.title }
+        }
+        // a terminal palette colour: black on red (the same colour on itself would show nothing)
+        Some(c) => Style { fg: Some(Color::Black), bg: Some(c), ..l.title },
+        None => Style { fg: Some(Color::Black), bg: Some(Color::Red), ..l.title },
+    }
+}
+
+/// A tab chip on the red bar: the same red, on a lighter dark red than the bar's.
+fn red_chip(l: &Look) -> Style {
+    use crossterm::style::Color;
+    match l.theme.color("red") {
+        Some(Color::Rgb { r, g, b }) => {
+            let mid = Color::Rgb { r: (r as f32 * 0.5) as u8, g: (g as f32 * 0.5) as u8, b: (b as f32 * 0.5) as u8 };
+            Style { fg: Some(Color::Rgb { r, g, b }), bg: Some(mid), ..l.footer_key }
+        }
+        _ => Style { fg: Some(Color::Red), bg: Some(Color::Black), ..l.footer_key },
     }
 }
 
@@ -4342,7 +7013,7 @@ fn put_facts(cv: &mut Canvas, l: &Look, x: u16, y: u16, e: &fsx::Entry, base: St
         x = cv.put(x, y, &fsx::human_size(e.size), tint(l, "cyan", base, bg), limit);
     }
     x = cv.put(x, y, "  ", base, limit);
-    x = cv.put(x, y, &fsx::date_string(e.mtime), tint(l, "purple", base, bg), limit);
+    x = cv.put(x, y, &fsx::date_string(e.mtime), tint(l, age_colour(e.mtime), base, bg), limit);
     if let Some(t) = &e.target {
         x = cv.put(x, y, "  → ", tint(l, "comment", base, bg), limit);
         x = cv.put(x, y, t, tint(l, "cyan", base, bg), limit);
@@ -4361,7 +7032,7 @@ fn hints(cv: &mut Canvas, l: &Look, x: u16, y: u16, limit: u16, keys: &[(&str, &
     let mut x = x + (room.saturating_sub(total) / 2) as u16;
     for (i, (k, lab)) in keys.iter().enumerate() {
         if i > 0 {
-            x = cv.put(x, y, " ", l.popup, limit);
+            x = hairline(cv, x, y, l.popup.bg, &l.footer_key, limit);
         }
         x = cv.put(x, y, &format!(" {k} "), l.footer_key, limit);
         x = cv.put(x, y, &format!(" {lab} "), l.footer_label, limit);

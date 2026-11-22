@@ -10,7 +10,7 @@ Status: early development.
 - Operations in Rust, no shell: copy, move, rename (one, or many at once in your editor), make a
   directory, change the mode, delete — to the system trash by default, or for good.
 - The system trash (the freedesktop.org one, shared with other file managers, `gio trash` and
-  `trash-cli`): Ctrl-c t shows it in a panel, where items are restored, deleted for good, or the trash
+  `trash-cli`): `gt` shows it in a panel, where items are restored, deleted for good, or the trash
   emptied.
 - Every column in its own colour: the size by magnitude (bytes dim, K green, M yellow, G red), the date by
   age (today green, this week teal, this month blue, this year purple, older dim), the permissions per
@@ -19,13 +19,13 @@ Status: early development.
   (inotify); a panel whose directory is deleted goes to the nearest one that still exists.
 - Long operations run in the background with their progress on the title bar; Esc cancels. A target
   that exists asks: overwrite, skip, keep both — once, or for all the rest.
-- Ctrl-c u undoes the last operation (a move or rename moves back, a trashing is restored, a copy or a new
+- `au` undoes the last operation (a move or rename moves back, a trashing is restored, a copy or a new
   directory goes to the trash).
-- The quick view (F2) shows the file under the cursor in place of the other panel: a real Neovim (taken
+- The quick view (`vv`) shows the file under the cursor in place of the other panel: a real Neovim (taken
   warm from `lvim-fuzzy-cli pool` when it runs), with the built-in preview while Neovim catches up, for
   directories, and as a fallback; an archive shows its listing.
-- Tabs: Ctrl-c n opens one (on the same two directories), Ctrl-c w closes it, `gt` / `gT` / `g1`…`g9`
-  go between them; Ctrl-c , gives the tab a name of its own (empty: its directory's name again), Ctrl-c < / >
+- Tabs: `tN` opens one (on the same two directories), `td` closes it, `tn` `tp` `t1`…`t9`
+  go between them; `te` gives the tab a name of its own (empty: its directory's name again), `t<` / `t>` (past the end it wraps round)
   move it left / right. The title bar lists them: a click goes to a tab, a middle click closes it, a right click
   renames it.
   The tabs are remembered: leave lvc and start it again with no directory given, and it opens the way you left it — the
@@ -42,38 +42,39 @@ Status: early development.
   rest of the page; moving on drops what is stale — and kept in `~/.cache/lvim-media/` (by the file's size
   and times: a changed file is made again; kept under 500 MB), so they are instant the next time, after
   a restart too.
-- Symbolic links (Ctrl-c L: absolute or relative, in the other panel), the path / name / directory into
-  the clipboard (Ctrl-c y / Y / D: OSC 52 and wl-copy / xclip).
-- Several lvc at once: each listens on `$XDG_RUNTIME_DIR/lvim-commander/<pid>.sock`; Ctrl-c I lists the
+- Symbolic links (`aL`: absolute or relative, in the other panel), the path / name / directory into
+  the clipboard (`yp` / `yn` / `yd`: OSC 52 and wl-copy / xclip).
+- Several lvc at once: each listens on `$XDG_RUNTIME_DIR/lvim-commander/<pid>.sock`; `ti` lists the
   others (go to its directory, bring it here, copy / move the marked to it), `lvc --list` and
   `lvc --send <pid|all> <instruction>` from a shell or a script.
-- Archives: Ctrl-c e extracts the one under the cursor into the other panel, Ctrl-c z packs the marked ones
+- Archives: `ae` extracts the one under the cursor into the other panel, `az` packs the marked ones
   (`.tar.gz .tar.xz .tar.bz2 .tar.zst .tar .zip .7z`); the quick view lists them, and also `.rar`, and
   `.deb .rpm .iso .cpio .cab .xar .tar.lz` through `bsdtar` (libarchive also stands in for a missing
   `unzip` / `7z` / `unrar`).
-- Ctrl-c f / Ctrl-c g run the lvim-fuzzy finder (files / live grep) from the panel's directory and bring the
+- `ff` / `fg` run the lvim-fuzzy finder (files / live grep) from the panel's directory and bring the
   panel to the result.
 - Material file icons as IMAGES (as lvim-icons draws them in Neovim) where the terminal takes kitty
   placeholders — kitty, ghostty, zellij built with them — else Nerd Font glyphs (`icons = "auto"`).
 - Two modes: normal (`j` / `k`, `gg` / `G`, `h` / `l`, Space marks, `.` hidden files) and input
   (Ctrl-f or `/`: typing filters; Enter / Esc back).
-- F9: a menu of every operation and every user action; extensible — see [Extending](#extending).
-- Bookmarks and the recently visited directories (Ctrl-c b), go to a typed path (Ctrl-c c), a shell command in
-  the panel's directory (Ctrl-c x), the editor (F6), opening by extension (`[open]`, else the editor for
+- `oo`: a menu of every operation and every user action; extensible — see [Extending](#extending).
+- Bookmarks and the recently visited directories (`gb`), go to a typed path (`gc`), a command run in the shell (`ax`), the shell under the
+  panels (`as` / `Ctrl-o`), the editor (`oe`), opening by extension (`[open]`, else the editor for
   text and `xdg-open` for the rest).
 
 ## Keys
 
-The F-keys and the moving keys are direct; **every other command is Ctrl-c, then a key** — after Ctrl-c
-the bottom shows them all (as Neovim's key helper does). F1 lists everything. Ctrl-c is the **leader**;
-`leader = "ctrl-a"` (any Ctrl- or Alt- key, not Ctrl-j / Ctrl-k) changes it, and every `Ctrl-c` in this text is
-then that key. Every command's key can be moved in `[keys]` (below).
+The F-keys and the moving keys are direct; **every other command sits in a key group**: the first letter of
+a group (`t` tabs, `m` marks, `a` actions, `y` copy, `f` find, `g` go, `v` view), then the command's letter —
+`tn` is the next tab, `ma` marks all. The bar at the bottom shows the groups (buttons: a click works too);
+after a group's letter it shows that group's keys, `Esc` leaves; when it is longer than the screen it scrolls (← → in a group, the wheel, the arrows at its ends, Ctrl-j then h / l). `?` or `g?` lists everything. The F-keys are not bound; `[keys]` can give any of them to an action. (There is no leader
+key: `leader` in the config is an error that says so.) Any command can be moved to a key of its own in `[keys]`.
 
 | Key | |
 |---|---|
 | Tab · Ctrl-h · Ctrl-l | the other panel · the left one · the right one |
 | j k · gg G · ↑ ↓ PgUp PgDn Home End | move · top / bottom of the panel |
-| l · Enter · → | enter a directory, open a file |
+| l · Enter · → | enter a directory **or an archive** (unpacked once into `~/.cache/lvim-commander/arc`; `h` at its top comes out; changes inside are not written back), open a file |
 | h · Backspace · ← | up one directory |
 | Ctrl-f · / | input mode: typing filters (fuzzy); Enter / Esc back |
 | Space · Insert | mark and move down |
@@ -81,46 +82,96 @@ then that key. Every command's key can be moved in `[keys]` (below).
 | J · K | the quick view: the next / previous page of a PDF or document, point of a video (5 % steps); else scroll 3 lines |
 | Ctrl-e · Ctrl-y | scroll the quick view one line |
 | Ctrl-d · Ctrl-u | half a page down / up — of the quick view when it is open (a Neovim preview gets the keys), else of the list |
-| F1 | help |
-| F2 | quick view |
-| F3 | copy (to the other panel; the target can be edited) |
-| F4 | rename (with several marked: all of them in the editor) |
-| F5 | move (to the other panel; the target can be edited) |
-| F6 | edit — a file, or a directory (the editor opens it there) |
-| F7 | new: a file, or a directory when the name ends in `/` (`a/b/` and `a/b/c.txt` make the directories on the way) |
-| F8 · Delete | to the trash (`delete = "direct"`: for good) |
-| Shift-F8 | delete for good |
-| F9 | the menu: every operation and user action |
-| F10 · Ctrl-q | quit |
+| Delete | to the trash (`delete = "direct"`: for good) |
+| Ctrl-q | quit |
+| Ctrl-k | with several tabs, up onto the **tab bar** (a tab is lit): `h` / `l` (← →, Tab) choose, `Enter` goes to it, `Esc` / `j` / `Ctrl-j` back to the panels, `Ctrl-k` again out of lvc (Zellij) |
 | Ctrl-j | onto the bottom bar: its buttons as real buttons — h / l (← →, Tab) choose, Enter or Space presses, Ctrl-k (or Esc, k) back to the panel it came from; the mouse presses them too |
 
-After **Ctrl-c**:
+The groups (`Esc` leaves one):
 
-| Key | |
+| Keys | |
 |---|---|
-| f · g | find files · grep (lvim-fuzzy) |
-| c · b | go to a directory · bookmarks and recent directories |
-| x | run a shell command here |
-| t | the trash (there: F5 or r restore, F8 delete for good, e empty) |
-| m | permissions: ticks (owner / group / others × read / write / exec, setuid / setgid / sticky) and a field for octal (`755`) or symbolic (`u+x,g-w,o=r`, `+X`, applied to each item's own mode) — a tick changes the field, the field changes the ticks |
-| O | owner and group: drop-downs of the real users (root and the people's accounts) and groups (yours first); typing filters a drop-down |
-| z · e | compress the marked · extract |
-| u | undo the last operation |
-| a · * · + · - | mark all · invert · mark / unmark by glob |
-| h · l · s · S | hidden files · long view (permissions, owner, group) · sort · reverse |
-| n · w | a new tab · close this tab (`gt` `gT` `g1`…`g9` go between them) |
-| , · < · > | rename this tab (empty: back to its directory's name) · move it left · right |
-| I | the other running lvc |
-| y · Y · D | copy the path(s) · the name(s) · the panel's directory to the clipboard |
-| L | symbolic links to the marked in the other panel (Tab in the dialog: absolute / relative) |
-| v | the columns beside the names — type, permissions, owner, group, size, date — each on / off (remembered) |
-| p | swap the panels |
-| o · i | the directory under the cursor / this one in the other panel |
-| [ · ] | back / forward in the history |
-| r | reload |
-| 1 … 0 | F1 … F10, for a terminal (or multiplexer) that keeps the F-keys |
-| H | show / hide this bar of hints |
-| ? · q | help · quit |
+| `tN` · `tn` `tp` · `td` · `te` | a new tab · the next / previous · close · rename (empty: back to its directory's name) |
+| `t<` `t>` · `t1`…`t9` · `ti` | move this tab left / right (past the end it wraps round) · go to that tab · the other running lvc |
+| `oc` `om` · `oN` · `on` · `oe` | copy · move (to the other panel; the target can be edited, and may end in a rename mask: `*.md` gives every file its name without the last extension + `.md`, `old_**` puts `old_` before the whole name) · rename (several marked: all in the editor) · new (a directory when the name ends in `/`; `a/b/` and `a/b/c.txt` make the directories on the way) · edit (a directory too) |
+| `or` · `oR` | refresh the panels · rename the tab (`te` too) |
+| `od` `oD` · `oo` | to the trash (`delete = "direct"`: for good) · delete for good · the menu: every operation and user action |
+| `ot` | the running operations: operations run side by side (a second copy does not wait for the first); here each is listed with its progress, `x` cancels the selected one. `Esc` in the lists cancels the newest |
+| `ma` · `m*` · `m+` `m-` | mark all · invert · mark / unmark by glob |
+| `as` · `Ctrl-o` | the shell under the panels (as in Midnight Commander): a real shell on a pseudo terminal, started in this directory the first time and kept alive between visits; while it is shown lvc is out of the way (the terminal's own screen, with its history); `Ctrl-o` again comes back and the panel goes to the directory the shell is in; `exit` ends it |
+| `az` · `ae` | compress the marked · extract |
+| `am` | permissions: ticks (owner / group / others × read / write / exec, setuid / setgid / sticky) and a field for octal (`755`) or symbolic (`u+x,g-w,o=r`, `+X`, applied to each item's own mode) — a tick changes the field, the field changes the ticks |
+| `ao` | owner and group: the group first, then the user; drop-downs of the real groups (yours first) and — for the chosen group — only the people in it (those it lists and those whose primary group it is); choosing a group moves the user to the first person of it when the chosen one is not in it; typing filters a drop-down |
+| `aL` · `au` | symbolic links to the marked in the other panel · undo the last operation |
+| `:` · `ax` | the **command line**: one row over the button bar, `dir $ command`; Enter types the command into the shell under the panels (in this panel's directory) and shows the shell — the output has your aliases, colours and icons; `Ctrl-o` comes back. `Tab` completes the word under the cursor — a command from `$PATH` for the first word, a path (relative to the panel's directory, `~/` too, spaces escaped) for the rest: the common start first, the candidates on the row above, `Tab` again goes through them. Up / Down recall the commands typed before (kept in `~/.local/state/lvim-commander/shell_history`), `Ctrl-u` clears, `Esc` closes |
+| `ar` · `aE` · `aq` | in the trash: restore · empty · quit |
+| `yy` `yx` | put the marked items (or the one under the cursor) into the **buffer**, to copy / to move; the marks go. The buffer is a file (`~/.local/state/lvim-commander/buffer.toml`), so every lvc sees it and it survives a restart |
+| `pp` `po` `pc` | paste: into this directory · into the other panel's · as copies whatever the buffer holds (a cut buffer moves, and is emptied by `pp` / `po`) |
+| `pr` · `pl` `ph` | paste with the target as a field (a rename mask may end it) · as symbolic links (Tab: absolute / relative) · as hard links |
+| `pm` · `pv` `pd` | copy the paths in the system clipboard here (wl-paste / xclip) · what is in the buffer · empty it |
+| `yp` `yn` `yd` | copy the path(s) · the name(s) · the panel's directory to the clipboard (text) |
+| `ff` `fg` | find files · grep (lvim-fuzzy) |
+| `rc` `rl` · `ra` · `re` · `rd` | the **remote connections** (FileZilla's site manager): a list of them with their state (`●` connected, `○` not): Enter connects, and on a connected one the button is **disconnect** — that is the only way out of a remote (`h` / Backspace / `..` stop at its top and say so), and it brings the panel back to its last folder on this machine; the **title bar is red** while the active panel is on a remote (`REMOTE` in the title; `h` at the top comes back) · make a new one in a form that asks in plain words (the kind of connection from a list: SFTP, FTP, an rclone remote, a server opened as a folder with sshfs, an rclone remote as a folder, a mount of your own; then the server from the hosts of `~/.ssh/config`, the key from `~/.ssh`, the remote from `rclone listremotes` — every such field opens a list with `Enter`, and you can type instead) · change one · delete one. They are written into `~/.config/lvim-plugins/lvim-fuzzy-plugin-remote.toml` (comments in it stay), so lfz sees them too; a password is never written — it is asked for when the server refuses the login, and kept for the session |
+| `gG` | from a remote back to your own folders — the panel returns to its last folder here and the connection stays open (`rc` opens it again, and disconnects) |
+| `gg` · `gc` `gb` · `gt` | top · go to a directory · bookmarks and recent · the trash |
+| `g[` `g]` · `go` `gi` · `g?` | back / forward in the history · the directory under the cursor / this one → the other panel · help |
+| `vv` · `vi` | the quick view on / off · info about the file under the cursor: path, kind, type, size, mode, owner, the three times, link target |
+| `vb` | synchronized browsing (see Remote files) |
+| `vz` | zoom: the active panel has the whole screen (`vz` again, or `Tab`, to get two panels) |
+| `os` · `gi` | the other panel goes where this one is: a folder of this machine, or the same connection and path on a remote |
+| `vd` | compare the two panels' directories by name, size and time: in each panel what the other lacks or has different is marked (copy it with `oc`) |
+| `vc` · `vl` · `vh` | the columns beside the names (remembered) · long view · hidden files |
+| `vs` `vS` · `vw` · `vr` · `vH` | sort · reverse · swap the panels · reload · show / hide the key row |
+| `hjkl` · `/` · `Space` · `.` | move · search · mark · hidden files |
+| `u` · `R` | undo the last operation (a move or rename moves back, a trashing is restored, a copy or a new file goes to the trash) · redo it, that is: do again what the last undo took back (`au` / `aU` are the same keys); a new operation clears what could be redone. Remote operations are not undone |
+| `V` | visual mode: the rows from where it was pressed to the cursor are marked as you move; `Esc` or `V` ends it (the marks stay) |
+
+## Remote files
+
+`rl` opens a remote in the active panel (`ra` makes a connection, `re` changes one, `rd` deletes one); the directories are read by the **remote plugin** (`lvim-fuzzy-plugin-remote`,
+which ships inside lvc and lfz) in the background — the panel says `REMOTE …` until the answer comes, and lvc never
+waits for the network. Which engine serves a remote is the plugin's configuration (what `ra` writes, or `[plugins.lvim-fuzzy-plugin-remote]`
+in lvc's config, or `~/.config/lvim-plugins/lvim-fuzzy-plugin-remote.toml` for every tool):
+
+- `rclone` (the default): the remotes of `rclone listremotes` — SFTP, FTP, S3, Google Drive, Dropbox, OneDrive, WebDAV,
+  SMB … — made with `rclone config`;
+- `sftp`: SFTP over SSH (libssh2; `~/.ssh/config` understood, the ssh-agent or a key) and `ftp`: plain FTP — built into the plugin;
+- `mount`: `sshfs`, `rclone mount`, `gio mount` … — a `mount` command, or a `root` that is mounted already;
+- an engine of your own: `kind = "command"` with the command lines to run.
+
+```toml
+[plugins.lvim-fuzzy-plugin-remote.remotes.work]
+engine = "mount"
+mount  = "sshfs me@work.example.org: {mnt}"
+```
+
+On a remote panel the keys are the usual ones — nothing to learn twice:
+
+| Keys | On a remote |
+|---|---|
+| `Enter` · `l` · `h` | walk the directories; `Enter` on a file **downloads it to the folder of the other panel** (like a double click in FileZilla; `enter = "open"` in the plugin's settings makes it download a copy into the cache — `~/.cache/lvim-fuzzy-remote`, kept under `cache` MB, the message says where — and open it as any file is opened); on an archive it enters it (`h` at its top comes back to the remote) |
+| `vv` | the quick view of a remote file: its copy is downloaded (up to `preview` MB) and the preview plugins show it |
+| `oe` | edit: the copy is opened in the editor and **goes back to the remote when it changed** |
+| `oc` · `om` | copy / move between a remote and a local panel, in both directions, several marked at once (one job each, with progress; `Esc` stops it; `ot` lists them) |
+| `on` · `oN` · `od` `oD` | make a directory (a name ending in `/`) or an empty file · rename · delete for good (there is no trash) |
+| `am` | permissions, with the same dialog (octal, symbolic, ticks) — where the engine knows them |
+| `ao` | owner and group with the **real users and groups of the remote machine** (read from its `/etc/passwd` and `/etc/group`): the group first, then a user of that group |
+| `aL` | a symbolic link in the remote directory to the entry under the cursor |
+| `ae` | unpack a remote archive into the other (local) panel |
+| `yy` `yx` · `pp` `po` `pc` | the buffer works across: `yy` / `yx` in a remote panel puts remote files in it, `yy` in a local one puts local files; `pp` pastes into this panel — a local files into a remote directory is an upload, remote files into a local one a download, a cut inside one remote is a rename, and from one remote to another goes through a temporary copy on this machine |
+| `vd` | compare the local and the remote directory (name, size, time) |
+| `vb` | synchronized browsing: when one panel goes into a directory or out of one, the other does the same when it can |
+
+Not on a remote (yet): the finder (`ff` / `fg`; lfz can find in a remote: `lvim-fuzzy-cli --remote work:/srv`), compress, the shell
+in the remote directory, . What an engine cannot do it says:
+`rclone` cannot set permissions or owners (use `sftp`), `ftp` can set permissions only, `mount` and `sftp` do it all.
+
+## As a file chooser
+
+`lvc --chooser-file FILE [DIR…]`: Enter on a file — or on the marked ones — writes the paths to FILE, one on a line,
+and quits; a directory is entered as always. Quitting (`aq`) without choosing writes nothing, so remove FILE first and
+read it after. The tabs are not restored or saved in this mode (it is a visit, not the way lvc was left).
+E.g. an editor's file picker: `lvc --chooser-file /tmp/pick "$PWD" && cat /tmp/pick`.
 
 ## Icons
 
@@ -133,7 +184,7 @@ that does not take kitty placeholders.
 ## Extending
 
 ```toml
-[actions.gitlog]                  # a key and / or an entry of the F9 menu → a command
+[actions.gitlog]                  # a key and / or an entry of the `oo` menu → a command
 title   = "git log of the file"
 key     = "ctrl-c L"   
 command = "git log --oneline -- {}"
@@ -231,7 +282,7 @@ eval "$(lvc --zsh)"   # ~/.zshrc: then `lvcd` opens lvc and cds to where you lef
 
 ## State
 
-`lvc` remembers whether the quick view (F2) was open and which columns show (Ctrl-c v), in `~/.local/state/lvim-commander/state.toml`
+`lvc` remembers whether the quick view (`vv`) was open and which columns show (`vc`), in `~/.local/state/lvim-commander/state.toml`
 (`$XDG_STATE_HOME`): it starts as you left it.
 
 ## Config
@@ -240,9 +291,9 @@ eval "$(lvc --zsh)"   # ~/.zshrc: then `lvcd` opens lvc and cds to where you lef
 
 ```toml
 theme   = "LvimEverforest_dark"  # an lvim theme; default: lvim-fuzzy's (~/.config/lvim-fuzzy)
-delete  = "trash"                # F8: "trash" | "direct"
+delete  = "trash"                # od, Delete: "trash" | "direct"
 hidden  = false                  # show dotfiles at start
-key_hints = true                 # the bar of the Ctrl-c commands (Ctrl-c H toggles it)
+key_hints = true                 # the bar of key groups at the bottom (v H toggles it)
 watch   = true                   # show at once what other programs change in the shown directories
 editor  = "nvim"                 # default: $VISUAL, $EDITOR, nvim
 preview = "nvim"                 # the quick view: "nvim" | "file" | "off"
@@ -250,18 +301,16 @@ nvim    = "nvim"
 pool    = true                   # take the preview's Neovim from `lvim-fuzzy-cli pool`
 image_transfer = "file"          # pictures: the terminal reads a temp file (fast); "direct" sends the bytes
 
-leader  = "ctrl-c"               # the key that starts a command; "ctrl-a", "alt-x", ...
-
-[keys]                           # any command on another key (F1 shows the new ones, the bar too)
+[keys]                           # any command on another key (`?` shows the new ones)
 copy = "f5"                      # the F-key actions: help view copy rename move edit new trash delete menu quit
 move = "f3"                      # a key whose command moved elsewhere does nothing
-edit = "leader k"                # "f5", "shift-f8", "leader x" (after the leader), "alt-x", "ctrl-x", "tab", "space"
-find = "alt-f"                   # the commands after the leader: find grep goto bookmarks shell trash-view restore
+edit = "f9"                      # "f5", "shift-f8", "alt-x", "ctrl-x", "tab", "space"
+find = "alt-f"                   # the commands of the groups: find grep goto bookmarks shell trash-view restore
 up   = "ctrl-p"                  # empty-trash chmod chown compress extract undo mark-all invert-marks mark-glob ...
 "git.log" = "alt-g"              # a plugin's action: "plugin.action"; a config action: its id
                                  # (lvc --plugins lists them; plugins load first, then these move their keys)
 
-[bookmarks]                      # Ctrl-c b
+[bookmarks]                      # gb
 home = "~"
 code = "~/development"
 

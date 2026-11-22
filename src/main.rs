@@ -3,6 +3,7 @@
 
 mod app;
 pub use lvim_fuzzy_ui::archive;
+mod complete;
 mod config;
 mod fsx;
 mod ops;
@@ -10,6 +11,7 @@ mod panel;
 mod instances;
 mod mux;
 mod plugins;
+mod subshell;
 mod term;
 mod trash;
 mod watch;
@@ -24,6 +26,9 @@ USAGE
 
 OPTIONS
     --print-dir     print the active panel's directory on exit (for `cd`)
+    --chooser-file FILE
+                    a file chooser: Enter on a file (or on the marked ones) writes the paths to FILE, one a line,
+                    and quits; quitting without choosing writes nothing (remove FILE first)
     --zsh, --bash   print a shell function `lvcd` that changes to that directory
     --plugins       list the plugins, actions and previewers, and any problem with them
     --types [open|preview]
@@ -47,6 +52,7 @@ fn main() {
     // started to BE the preview plugin (a process the plugin host runs): answer as it, nothing else
     lvim_fuzzy_plugin_preview::run_if_asked(&args);
     lvim_fuzzy_plugin_open::run_if_asked(&args);
+    lvim_fuzzy_plugin_remote::run_if_asked(&args);
     // the other instances: list them, or send one (or all) an instruction
     match args.first().map(String::as_str) {
         Some("--list") => {
@@ -84,8 +90,10 @@ fn main() {
         _ => {}
     }
     let mut print_dir = false;
+    let mut chooser: Option<PathBuf> = None;
     let mut dirs: Vec<PathBuf> = Vec::new();
-    for a in &args {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
         match a.as_str() {
             "-h" | "--help" => {
                 print!("{HELP}");
@@ -100,6 +108,13 @@ fn main() {
                 return;
             }
             "--print-dir" => print_dir = true,
+            "--chooser-file" => match it.next() {
+                Some(f) => chooser = Some(PathBuf::from(f)),
+                None => {
+                    eprintln!("lvim-fuzzy-commander: --chooser-file needs a file");
+                    std::process::exit(2);
+                }
+            },
             "--install-icons" => {
                 let dir = lvim_fuzzy_ui::iconimg::shared_dir().map(|d| d.display().to_string()).unwrap_or_default();
                 match lvim_fuzzy_ui::iconimg::install_shared() {
@@ -183,7 +198,7 @@ fn main() {
         let p = if p.is_absolute() { p } else { cwd.join(p) };
         std::fs::canonicalize(&p).unwrap_or(p)
     };
-    let explicit_dirs = !dirs.is_empty();
+    let explicit_dirs = !dirs.is_empty() || chooser.is_some();
     let left = dirs.first().cloned().map(abs).unwrap_or_else(|| cwd.clone());
     let right = dirs.get(1).cloned().map(abs).unwrap_or_else(|| left.clone());
     for d in [&left, &right] {
@@ -231,10 +246,14 @@ fn main() {
     lvim_fuzzy_ui::iconimg::init(cfg.icons, cfg.zellij_images);
     // the previews' disk cache kept under 500 MB (off the way: a thread)
     std::thread::spawn(|| lvim_fuzzy_ui::media::prune_cache(500 << 20));
+    std::thread::spawn(app::prune_arcs);
     let mut app = app::App::new(cfg, look, left, right, notes, actions, previewers, p_defs);
     // started with no directory: the tabs open as they were left; with directories given, they are what you asked for
     if !explicit_dirs {
         app.restore_tabs(&config::load_state());
+    }
+    if let Some(f) = chooser {
+        app.set_chooser(f);
     }
     let out = app.run(&mut term);
     drop(term);

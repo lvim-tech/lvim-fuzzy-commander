@@ -266,10 +266,10 @@ pub fn parse_actions(
         };
         let key = match s("key") {
             None => None,
-            Some(k) => match KeySpec::parse(&k) {
+            Some(k) => match KeySpec::parse(&k).filter(|k| !k.chord) {
                 Some(k) => Some(k),
                 None => {
-                    errs.push(format!("{at}: actions.{id}.key: `{k}` (leader x, f11, ...)"));
+                    errs.push(format!("{at}: actions.{id}.key: `{k}` (f11, alt-x, ...; the leader is gone)"));
                     None
                 }
             },
@@ -663,7 +663,7 @@ mod tests {
         std::fs::create_dir_all(root.join("cmd")).unwrap();
         std::fs::write(
             root.join("rt/plugin.toml"),
-            "runtime = \"process\"\nexec = \"./run\"\nevents = [\"cd\"]\n[actions.x]\ntitle = \"X\"\nkey = \"ctrl-c x\"\ncall = \"do_x\"\n",
+            "runtime = \"process\"\nexec = \"./run\"\nevents = [\"cd\"]\n[actions.x]\ntitle = \"X\"\nkey = \"alt-x\"\ncall = \"do_x\"\n",
         )
         .unwrap();
         std::fs::write(root.join("bad/plugin.toml"), "runtime = \"java\"\n").unwrap();

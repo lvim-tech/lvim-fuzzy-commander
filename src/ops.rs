@@ -220,17 +220,28 @@ pub fn move_path(src: &Path, dst: &Path, progress: &mut dyn FnMut(u64) -> bool) 
     }
 }
 
+/// The new name of `name` under a rename mask (`*.md`, `old_**`): `*` is the name without its last extension,
+/// `**` the whole name.
+pub fn apply_mask(mask: &str, name: &str) -> String {
+    let stem = match name.rfind('.') {
+        Some(i) if i > 0 => &name[..i],
+        _ => name,
+    };
+    mask.replace("**", "\u{0}").replace('*', stem).replace('\u{0}', name)
+}
+
 /// Start a job over `sources`. For Copy / Move, `dest` is the directory they go into (or, for ONE
-/// source, a full new path when it does not name an existing directory).
-pub fn start(kind: JobKind, sources: Vec<PathBuf>, dest: Option<PathBuf>) -> Job {
+/// source, a full new path when it does not name an existing directory); with a `mask` every source
+/// goes into the directory `dest` under its masked name.
+pub fn start(kind: JobKind, sources: Vec<PathBuf>, dest: Option<PathBuf>, mask: Option<String>) -> Job {
     let (tx, rx) = channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let c = cancel.clone();
-    std::thread::spawn(move || run(kind, sources, dest, tx, c));
+    std::thread::spawn(move || run(kind, sources, dest, mask, tx, c));
     Job { kind, rx, cancel }
 }
 
-fn run(kind: JobKind, sources: Vec<PathBuf>, dest: Option<PathBuf>, tx: Sender<Report>, cancel: Arc<AtomicBool>) {
+fn run(kind: JobKind, sources: Vec<PathBuf>, dest: Option<PathBuf>, mask: Option<String>, tx: Sender<Report>, cancel: Arc<AtomicBool>) {
     let total: u64 = match kind {
         JobKind::Copy | JobKind::Move => sources.iter().map(|s| tree_size(s)).sum(),
         _ => sources.len() as u64,
@@ -260,7 +271,9 @@ fn run(kind: JobKind, sources: Vec<PathBuf>, dest: Option<PathBuf>, tx: Sender<R
             JobKind::Copy | JobKind::Move => {
                 let Some(dest) = &dest else { break };
                 // into an existing directory, or (one source) to a new full path
-                let mut target = if dest.is_dir() {
+                let mut target = if let Some(m) = &mask {
+                    dest.join(apply_mask(m, &file))
+                } else if dest.is_dir() {
                     dest.join(&file)
                 } else {
                     dest.clone()
@@ -413,6 +426,78 @@ pub fn start_command(kind: JobKind, mut cmd: std::process::Command, label: Strin
     Job { kind, rx, cancel }
 }
 
+/// Run a shell line of `xfer` verbs (see the remote plugin) as a job: the progress is read from what it prints (JSON lines), an
+/// `{"error":…}` line is an error of the job; stopping it kills the whole process group.
+pub fn start_remote(kind: JobKind, line: String, label: String) -> Job {
+    use std::io::BufRead;
+    use std::os::unix::process::CommandExt;
+    let (tx, rx) = channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let c = cancel.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(Report::Progress { done: 0, total: 0, file: label.clone() });
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg(&line).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).process_group(0);
+        let mut child = match cmd.spawn() {
+            Ok(ch) => ch,
+            Err(e) => {
+                let _ = tx.send(Report::Done { count: 0, errors: vec![format!("{label}: {e}")], undo: Vec::new() });
+                return;
+            }
+        };
+        let (ltx, lrx) = channel::<String>();
+        if let Some(out) = child.stdout.take() {
+            std::thread::spawn(move || {
+                for l in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+                    if ltx.send(l).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        let mut errors: Vec<String> = Vec::new();
+        let status = loop {
+            if c.load(Ordering::Relaxed) {
+                // SAFETY: a signal to the process group this job started
+                unsafe { libc::kill(-(child.id() as i32), libc::SIGTERM) };
+            }
+            while let Ok(l) = lrx.try_recv() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&l) else { continue };
+                if let Some(p) = v.get("progress") {
+                    let _ = tx.send(Report::Progress { done: p[0].as_u64().unwrap_or(0), total: p[1].as_u64().unwrap_or(0), file: label.clone() });
+                } else if let Some(e) = v.get("error").and_then(|e| e.as_str()) {
+                    errors.push(e.to_string());
+                }
+            }
+            match child.try_wait() {
+                Ok(Some(st)) => break Some(st),
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(40)),
+                Err(_) => break None,
+            }
+        };
+        // what the reader had not handed over yet
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        while let Ok(l) = lrx.try_recv() {
+            if let Some(e) = serde_json::from_str::<serde_json::Value>(&l).ok().and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string)) {
+                errors.push(e);
+            }
+        }
+        let ok = status.is_some_and(|s| s.success()) && errors.is_empty();
+        // what the commands themselves said (a failed `mv`, a crash), when the plugin gave no error of its own
+        if !ok && errors.is_empty() && let Some(mut e) = child.stderr.take() {
+            use std::io::Read;
+            let mut err = String::new();
+            let _ = e.read_to_string(&mut err);
+            errors.extend(err.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).take(6));
+        }
+        if !ok && errors.is_empty() {
+            errors.push(if c.load(Ordering::Relaxed) { format!("{label}: cancelled") } else { format!("{label}: failed") });
+        }
+        let _ = tx.send(Report::Done { count: ok as usize, errors: if ok { Vec::new() } else { errors }, undo: Vec::new() });
+    });
+    Job { kind, rx, cancel }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,18 +530,18 @@ mod tests {
         std::fs::write(d.join("dst/src/sub/a.txt"), "old").unwrap();
 
         // skip: the existing tree stays as it was
-        let (n, e) = finish(start(JobKind::Copy, vec![d.join("src")], Some(d.join("dst"))), Conflict::Skip);
+        let (n, e) = finish(start(JobKind::Copy, vec![d.join("src")], Some(d.join("dst")), None), Conflict::Skip);
         assert_eq!((n, e.len()), (0, 0));
         assert_eq!(std::fs::read_to_string(d.join("dst/src/sub/a.txt")).unwrap(), "old");
 
         // overwrite: merged, the file replaced, the symlink kept a symlink
-        let (n, e) = finish(start(JobKind::Copy, vec![d.join("src")], Some(d.join("dst"))), Conflict::Overwrite);
+        let (n, e) = finish(start(JobKind::Copy, vec![d.join("src")], Some(d.join("dst")), None), Conflict::Overwrite);
         assert_eq!((n, e.len()), (1, 0), "{e:?}");
         assert_eq!(std::fs::read_to_string(d.join("dst/src/sub/a.txt")).unwrap(), "new");
         assert!(std::fs::symlink_metadata(d.join("dst/src/link")).unwrap().file_type().is_symlink());
 
         // rename: a second copy next to it
-        let (n, _) = finish(start(JobKind::Copy, vec![d.join("src/b.txt")], Some(d.join("src"))), Conflict::Rename);
+        let (n, _) = finish(start(JobKind::Copy, vec![d.join("src/b.txt")], Some(d.join("src")), None), Conflict::Rename);
         assert_eq!(n, 1);
         assert!(d.join("src/b (2).txt").exists());
         let _ = std::fs::remove_dir_all(&d);
@@ -468,14 +553,14 @@ mod tests {
         std::fs::create_dir_all(d.join("a")).unwrap();
         std::fs::write(d.join("a/f"), "x").unwrap();
         std::fs::create_dir_all(d.join("to")).unwrap();
-        let (n, _) = finish(start(JobKind::Move, vec![d.join("a")], Some(d.join("to"))), Conflict::Cancel);
+        let (n, _) = finish(start(JobKind::Move, vec![d.join("a")], Some(d.join("to")), None), Conflict::Cancel);
         assert_eq!(n, 1);
         assert!(d.join("to/a/f").exists() && !d.join("a").exists());
         // one source to a new full path = rename
-        let (n, _) = finish(start(JobKind::Move, vec![d.join("to/a")], Some(d.join("to/b"))), Conflict::Cancel);
+        let (n, _) = finish(start(JobKind::Move, vec![d.join("to/a")], Some(d.join("to/b")), None), Conflict::Cancel);
         assert_eq!(n, 1);
         assert!(d.join("to/b/f").exists());
-        let (n, _) = finish(start(JobKind::Delete, vec![d.join("to")], None), Conflict::Cancel);
+        let (n, _) = finish(start(JobKind::Delete, vec![d.join("to")], None, None), Conflict::Cancel);
         assert_eq!(n, 1);
         assert!(!d.join("to").exists());
         let _ = std::fs::remove_dir_all(&d);
@@ -485,9 +570,26 @@ mod tests {
     fn refuses_to_copy_into_itself() {
         let d = tmp("self");
         std::fs::create_dir_all(d.join("a")).unwrap();
-        let (n, e) = finish(start(JobKind::Copy, vec![d.join("a")], Some(d.join("a"))), Conflict::Cancel);
+        let (n, e) = finish(start(JobKind::Copy, vec![d.join("a")], Some(d.join("a")), None), Conflict::Cancel);
         assert_eq!(n, 0);
         assert_eq!(e.len(), 1, "{e:?}");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_remote_job_reports_progress_and_errors() {
+        let (n, e) = finish(start_remote(JobKind::Copy, "printf '{\"progress\":[1,2]}\\n{\"ok\":true}\\n'".into(), "x".into()), Conflict::Cancel);
+        assert_eq!((n, e.len()), (1, 0));
+        let (n, e) = finish(start_remote(JobKind::Copy, "printf '{\"error\":\"no route\"}\\n'; exit 1".into(), "x".into()), Conflict::Cancel);
+        assert_eq!(n, 0);
+        assert_eq!(e, vec!["no route".to_string()]);
+    }
+
+    #[test]
+    fn a_mask_renames() {
+        assert_eq!(apply_mask("*.md", "notes.txt"), "notes.md");
+        assert_eq!(apply_mask("old_**", "a.tar.gz"), "old_a.tar.gz");
+        assert_eq!(apply_mask("*", "Makefile"), "Makefile");
+        assert_eq!(apply_mask("**.bak", ".profile"), ".profile.bak");
     }
 }
