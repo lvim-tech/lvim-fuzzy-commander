@@ -115,7 +115,7 @@ The groups (`Esc` leaves one):
 | `rc` `rl` · `ra` · `re` · `rd` | the **remote connections** (FileZilla's site manager): a list of them with their state (`●` connected, `○` not): Enter connects, and on a connected one the button is **disconnect** — that is the only way out of a remote (`h` / Backspace / `..` stop at its top and say so), and it brings the panel back to its last folder on this machine; the **title bar is red** while the active panel is on a remote (`REMOTE` in the title; `h` at the top comes back) · make a new one in a form that asks in plain words (the kind of connection from a list: SFTP, FTP, an rclone remote, a server opened as a folder with sshfs, an rclone remote as a folder, a mount of your own; then the server from the hosts of `~/.ssh/config`, the key from `~/.ssh`, the remote from `rclone listremotes` — every such field opens a list with `Enter`, and you can type instead) · change one · delete one. They are written into `~/.config/lvim-plugins/lvim-fuzzy-plugin-remote.toml` (comments in it stay), so lfz sees them too; a password is never written — it is asked for when the server refuses the login, and kept for the session |
 | `gG` | from a remote back to your own folders — the panel returns to its last folder here and the connection stays open (`rc` opens it again, and disconnects) |
 | `gg` · `gc` · `gt` | top · go to a directory · the trash |
-| `gd` · `gu` · `ge` · `gC` | **devices** (the devices plugin's buttons, in `g`; installed with `install`): `gd` the disks and the gvfs mounts — Enter mounts what is not and goes into it; `gu` unmount; `ge` eject (a stick, a card, an external disk, a phone); `gC` connect to `smb://`, `sftp://`, `ftp://`, `dav://` with gvfs |
+| `gd` · `gC` | **devices** (the devices plugin's buttons, in `g`): `gd` the disks, the gvfs mounts and the phones that are plugged in — Enter mounts what is not and goes into it; on a row `m` mounts it, `u` unmounts it and `e` ejects it (a stick, a card, an external disk, a phone), and the list stays open, read again; `gC` connect to `smb://`, `sftp://`, `ftp://`, `dav://` with gvfs |
 | `vD` | **diff of two files** (the git plugin's button, in `v`): the two marked files, or the file under the cursor and the one of that name in the other panel, as a coloured text on the whole screen |
 | `xdc` | **the changes** (the git plugin's button): a flat list, with a search field, of what is changed or new in the work tree; Enter goes to the file |
 | `ba` · `bl` · `bd` · `br` | **bookmarks**: `ba` keeps the place the panel is in (a folder of this machine, or a folder of a remote) under a name; `bl` is the list — `★` the ones you kept, then the `[bookmarks]` of the config — with a search field (`/` or `Ctrl-f` types, `Esc` stops typing): Enter goes there (a remote bookmark connects), `o` goes there in the other panel, `d` deletes a kept one, `r` renames it; `bd` is a list to choose the one to delete and `br` one to rename (both have the search field). A bookmarked folder has a `★` in the type column (`vc`). They are kept in `$XDG_STATE_HOME/lvim-commander/bookmarks.toml`, shared by every lvc |
@@ -400,6 +400,17 @@ eval "$(lvc --zsh)"   # ~/.zshrc: then `lvcd` opens lvc and cds to where you lef
 `lvc` remembers whether the quick view (`vv`) was open and which columns show (`vc`), in `~/.local/state/lvim-commander/state.toml`
 (`$XDG_STATE_HOME`): it starts as you left it.
 
+## Settings
+
+`o S` (or `Ctrl-c C`) opens the **settings panel**: the settings that are worth changing while you work, in four tabs — **General** (editor, preview,
+a Neovim kept ready, key hints, theme), **Files** (hidden files, where delete goes, the desktop clipboard for `yy` / `yx`, following changes made
+outside), **Notifications** (the lowest level that shows as a card — `warn` shows warn and error —, how many cards at most, how many notifications the
+list `o i` keeps, the seconds a card of each level stays) and **Display** (file icons, images inside Zellij, how a picture reaches the terminal).
+`Tab` / `Shift-Tab` (or `[` `]`, or `1`–`4`) change the tab, `j` / `k` the row, `h` / `l` (or `Space`) the value. A change takes effect at once where it
+can (a row marked `next start` waits for the next start of lvc) and is written to `~/.local/state/lvim-commander/settings.toml`
+(`$XDG_STATE_HOME`). The same keys in `config.toml` win: the panel shows such a row as `(config.toml)` and does not change it. A level that does not
+show as a card is still in the list of `o i`.
+
 ## Config
 
 `~/.config/lvim-commander/config.toml` (`$LVIM_COMMANDER_CONFIG`); every key is optional:
@@ -414,10 +425,14 @@ editor  = "nvim"                 # default: $VISUAL, $EDITOR, nvim
 preview = "nvim"                 # the quick view: "nvim" | "file" | "off"
 nvim    = "nvim"
 pool    = true                   # take the preview's Neovim from `lvim-fuzzy-cli pool`
-git     = true                   # the git marks and the group x (the git plugin); off: git is not asked at all
-git_ignored = true               # mark ignored files too (dimmed); off is quicker beside a big ignored folder
 clipboard_files = true           # yy / yx put the files themselves in the desktop clipboard (text/uri-list) too
 image_transfer = "file"          # pictures: the terminal reads a temp file (fast); "direct" sends the bytes
+notifications = "warn"           # the lowest level that shows as a card: debug info status success warn error (the list `o i` keeps all)
+notification_cards = 4           # cards on the screen at most
+notification_history = 200       # notifications the list keeps
+
+[notification_seconds]           # how long a card of each level stays
+warn = 6
 
 [keys]                           # any command on another key (`?` shows the new ones)
 copy = "f5"                      # the F-key actions: help view copy rename move edit new trash delete menu quit
