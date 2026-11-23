@@ -178,6 +178,8 @@ enum Dialog {
     },
     /// Ctrl-c v: the columns beside the names, as ticks (they change at once).
     Columns { sel: usize },
+    /// `oS`: the settings that are kept (which notifications show, the key hints, the desktop clipboard): a tick each, written as it is ticked
+    Settings { tab: usize, sel: usize },
     /// A list to pick from with a search field (`/` or Ctrl-f types, Esc stops typing): the bookmarks. The keys of the list's items work
     /// when it is not typed in (Enter, `o`, `d`, `r` …).
     /// `cells`: for a list whose rows are columns (a plugin's), one row of (text, colour) per item, aligned under each other; else empty.
@@ -257,6 +259,8 @@ enum Builtin {
     Undo,
     Reload,
     Notifications,
+    /// The settings panel.
+    Settings,
     /// Print the folder of the choice (the marked entries, or the one under the cursor) and leave: `cd "$(lvc)"`.
     Cd,
     Help,
@@ -301,6 +305,7 @@ const CHORDS: &[(&str, &str, u8, &str)] = &[
     ("!", "tasks", 0, "tasks"),
     ("P", "cd to the choice", 0, "cd"),
     ("T", "notifications", 0, "notifications"),
+    ("C", "settings", 0, "settings"),
     ("=", "compare", 1, "compare"),
     ("@", "copy files", 1, "yank"),
     ("#", "cut files", 1, "cut"),
@@ -363,7 +368,7 @@ pub const GROUPS: &[(char, &str, &[(&str, &str)])] = &[
     ]),
     ('o', "operations", &[
         ("c", "copy"), ("m", "move"), ("r", "refresh"), ("R", "rename-tab"), ("N", "rename"), ("s", "here-to-other"), ("n", "new"), ("e", "edit"), ("d", "trash"), ("D", "delete"),
-        ("o", "menu"), ("t", "tasks"), ("p", "cd"), ("i", "notifications"),
+        ("o", "menu"), ("t", "tasks"), ("p", "cd"), ("i", "notifications"), ("S", "settings"),
     ]),
     ('b', "bookmarks", &[("a", "bookmark-add"), ("d", "bookmark-delete"), ("l", "bookmarks"), ("r", "bookmark-rename")]),
     ('v', "view", &[
@@ -584,6 +589,7 @@ const BUILTINS: &[(Builtin, &str, &str)] = &[
     (Builtin::Undo, "Undo", "a u"),
     (Builtin::Reload, "Reload", "v r"),
     (Builtin::Notifications, "Notifications", "o i"),
+    (Builtin::Settings, "Settings", "o S"),
     (Builtin::Cd, "Leave in the folder of the choice (cd)", "o p"),
     (Builtin::Help, "Keys", "?"),
 ];
@@ -613,14 +619,14 @@ fn short_name(plugin: &str) -> String {
     plugin.strip_prefix("lvim-fuzzy-plugin-").unwrap_or(plugin).to_string()
 }
 
-/// The levels of a notification: (name, label on the chip, glyph, theme colour, seconds on the screen). The index is the level.
-const LEVELS: [(&str, &str, &str, &str, u64); 6] = [
-    ("debug", "DEBUG", "\u{f188}", "comment", 2),
-    ("info", "INFO", "\u{f05a}", "blue", 3),
-    ("status", "STATUS", "\u{f110}", "cyan", 3),
-    ("success", "OK", "\u{f058}", "green", 3),
-    ("warn", "WARN", "\u{f071}", "yellow", 6),
-    ("error", "ERROR", "\u{f057}", "red", 9),
+/// The levels of a notification: (name, label on the chip, glyph, theme colour). The index is the level; the seconds a card stays are a setting.
+const LEVELS: [(&str, &str, &str, &str); 6] = [
+    ("debug", "DEBUG", "\u{f188}", "comment"),
+    ("info", "INFO", "\u{f05a}", "blue"),
+    ("status", "STATUS", "\u{f110}", "cyan"),
+    ("success", "OK", "\u{f058}", "green"),
+    ("warn", "WARN", "\u{f071}", "yellow"),
+    ("error", "ERROR", "\u{f057}", "red"),
 ];
 
 /// The level a name stands for (`info` when it is none).
@@ -988,16 +994,93 @@ impl App {
         self.notify_at(level_of(level), who, text);
     }
 
-    fn notify_at(&mut self, level: u8, who: &str, text: &str) {
-        let time: String = fsx::iso_now().chars().skip(11).take(8).collect();
-        let t = Toast { level, title: who.to_string(), text: text.to_string(), time, until: Instant::now() + Duration::from_secs(LEVELS[level as usize].4) };
-        // the same thing said again replaces the card (a status becomes its result, a repeated one does not pile up)
-        self.toasts.retain(|x| !(x.title == t.title && (x.text == t.text || (x.level == 2 && level != 2))));
-        self.toasts.push(t.clone());
-        if self.toasts.len() > 4 {
+    /// The values a setting steps through.
+    fn settings_options(&self, d: &crate::config::Def) -> Vec<String> {
+        use crate::config::Kind;
+        let cur = self.cfg.get(d.id);
+        let mut o: Vec<String> = match d.kind {
+            Kind::Bool => vec!["off".into(), "on".into()],
+            Kind::Choice(c) => c.iter().map(|s| s.to_string()).collect(),
+            Kind::Editor => ["nvim", "vim", "nano", "micro", "hx", "emacs -nw", "code -w"]
+                .iter()
+                .filter(|e| lvim_fuzzy_plugin::have(e.split_whitespace().next().unwrap_or("")))
+                .map(|s| s.to_string())
+                .collect(),
+            Kind::Theme => {
+                let mut t: Vec<String> = std::fs::read_dir(crate::config::themes_dir())
+                    .map(|d| d.filter_map(|e| e.ok()).filter_map(|e| e.path().file_stem().map(|s| s.to_string_lossy().into_owned())).collect())
+                    .unwrap_or_default();
+                t.sort();
+                t.dedup();
+                t
+            }
+            Kind::Num { .. } => Vec::new(),
+        };
+        if !cur.is_empty() && !o.contains(&cur) {
+            o.insert(0, cur);
+        }
+        o
+    }
+
+    /// A step of `by` in a setting of the settings panel: done at once where it can be, and kept.
+    fn settings_change(&mut self, id: &str, by: isize) {
+        use crate::config::Kind;
+        let Some(d) = crate::config::DEFS.iter().find(|d| d.id == id) else { return };
+        if self.cfg.fixed.iter().any(|f| f == d.key()) {
+            self.toast(format!("{}: set in config.toml, change it there", d.label), false);
+            return;
+        }
+        let cur = self.cfg.get(id);
+        let new = match d.kind {
+            Kind::Num { min, max, step } => (cur.parse::<i64>().unwrap_or(min) + by as i64 * step).clamp(min, max).to_string(),
+            _ => {
+                let o = self.settings_options(d);
+                if o.is_empty() {
+                    return;
+                }
+                let at = o.iter().position(|v| *v == cur).unwrap_or(0) as isize;
+                o[(at + by).rem_euclid(o.len() as isize) as usize].clone()
+            }
+        };
+        self.cfg.set(id, &new);
+        match id {
+            "key_hints" => self.chord_hints = self.cfg.key_hints,
+            "hidden" => {
+                let on = self.cfg.hidden;
+                for p in &mut self.panels {
+                    p.hidden = on;
+                    p.reload();
+                }
+            }
+            _ => {}
+        }
+        // the cards and the list follow the new limits at once
+        let min = self.cfg.notify_min;
+        self.toasts.retain(|t| t.level as usize >= min);
+        while self.toasts.len() > self.cfg.notify_cards {
             self.toasts.remove(0);
         }
-        if self.notes.len() >= 200 {
+        while self.notes.len() > self.cfg.notify_history {
+            self.notes.remove(0);
+        }
+        if let Err(e) = crate::config::save_settings(&self.cfg) {
+            self.toast(e, true);
+        }
+    }
+
+    fn notify_at(&mut self, level: u8, who: &str, text: &str) {
+        let time: String = fsx::iso_now().chars().skip(11).take(8).collect();
+        let t = Toast { level, title: who.to_string(), text: text.to_string(), time, until: Instant::now() + Duration::from_secs(self.cfg.notify_secs[level as usize]) };
+        // the same thing said again replaces the card (a status becomes its result, a repeated one does not pile up)
+        // a level the settings hide is not shown as a card, but the list (`oi`) keeps it
+        if level as usize >= self.cfg.notify_min {
+            self.toasts.retain(|x| !(x.title == t.title && (x.text == t.text || (x.level == 2 && level != 2))));
+            self.toasts.push(t.clone());
+            if self.toasts.len() > self.cfg.notify_cards {
+                self.toasts.remove(0);
+            }
+        }
+        if self.notes.len() >= self.cfg.notify_history {
             self.notes.remove(0);
         }
         self.notes.push(t);
@@ -1028,7 +1111,7 @@ impl App {
         let mut items = Vec::new();
         let mut cells = Vec::new();
         for n in self.notes.iter().rev() {
-            let (name, _, glyph, colour, _) = LEVELS[n.level as usize];
+            let (name, _, glyph, colour) = LEVELS[n.level as usize];
             cells.push(vec![(n.time.clone(), "comment".into()), (format!("{glyph} {name}"), colour.into()), (n.title.clone(), "purple".into()), (n.text.clone(), String::new())]);
             items.push((format!("{} {name} {} {}", n.time, n.title, n.text), MenuItem::Note));
         }
@@ -2026,6 +2109,7 @@ impl App {
             }
             KeyCode::Char('P') if chord => self.cd_choice(),
             KeyCode::Char('T') if chord => self.notifications(),
+            KeyCode::Char('C') if chord => self.dialog = Some(Dialog::Settings { tab: 0, sel: 0 }),
             KeyCode::Char('=') if chord => self.compare_panels(),
             KeyCode::Char('@') if chord => self.yank(false),
             KeyCode::Char('#') if chord => self.yank(true),
@@ -3454,6 +3538,46 @@ impl App {
                 }
                 self.dialog = Some(Dialog::Columns { sel });
             }
+            Dialog::Settings { mut tab, mut sel } => {
+                let rows: Vec<&crate::config::Def> = crate::config::DEFS.iter().filter(|d| d.tab == tab).collect();
+                let n = rows.len().max(1);
+                let tabs = crate::config::TABS.len();
+                match k.code {
+                    KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
+                    KeyCode::Char('j') | KeyCode::Down => sel = (sel + 1) % n,
+                    KeyCode::Char('k') | KeyCode::Up => sel = (sel + n - 1) % n,
+                    // the tabs
+                    // (a terminal that reports keys with the keyboard protocol may send Shift-Tab as a Tab with Shift)
+                    KeyCode::BackTab | KeyCode::Char('[') => {
+                        tab = (tab + tabs - 1) % tabs;
+                        sel = 0;
+                    }
+                    KeyCode::Tab if k.modifiers.contains(KeyModifiers::SHIFT) => {
+                        tab = (tab + tabs - 1) % tabs;
+                        sel = 0;
+                    }
+                    KeyCode::Tab | KeyCode::Char(']') => {
+                        tab = (tab + 1) % tabs;
+                        sel = 0;
+                    }
+                    KeyCode::Char(c) if c.is_ascii_digit() && (1..=tabs).contains(&(c as usize - '0' as usize)) => {
+                        tab = c as usize - '1' as usize;
+                        sel = 0;
+                    }
+                    KeyCode::Char(' ') | KeyCode::Char('x') | KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                        if let Some(d) = rows.get(sel) {
+                            self.settings_change(d.id, 1);
+                        }
+                    }
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        if let Some(d) = rows.get(sel) {
+                            self.settings_change(d.id, -1);
+                        }
+                    }
+                    _ => {}
+                }
+                self.dialog = Some(Dialog::Settings { tab, sel });
+            }
             Dialog::Owner { paths, users, groups, mut user, mut group, mut members, remote, mut focus, mut open } => {
                 // row 0 is the group, row 1 the user: the user list holds only the people of the chosen group
                 let matches = |f: usize, q: &str, members: &[String]| -> Vec<usize> {
@@ -4431,6 +4555,7 @@ impl App {
                 }
             }
             Builtin::Notifications => self.notifications(),
+            Builtin::Settings => self.dialog = Some(Dialog::Settings { tab: 0, sel: 0 }),
             Builtin::Cd => self.cd_choice(),
             Builtin::Help => {
                 self.help = true;
@@ -6188,7 +6313,7 @@ impl App {
             if group.is_empty() {
                 continue;
             }
-            let (name, _, glyph, colour, _) = LEVELS[level as usize];
+            let (name, _, glyph, colour) = LEVELS[level as usize];
             let accent = tint(l, colour, l.popup, l.popup.bg).fg;
             let (head_bg, title_bg, body_bg) = (blend(l.popup.bg, accent, 0.30), blend(l.popup.bg, accent, 0.20), blend(l.popup.bg, accent, 0.10));
             let max_w = (w as usize).saturating_sub(4).clamp(30, 100);
@@ -6948,6 +7073,64 @@ impl App {
                     cv.put(x, y, lab, lst, lim);
                 }
                 hints(cv, l, r.x, r.y + all.len() as u16 + 1, lim, &[("Space", "tick"), ("J/K", "move column"), ("j/k", "choose"), ("Esc", "close")]);
+            }
+            Dialog::Settings { tab, sel } => {
+                use crate::config::{DEFS, Kind, TABS};
+                let rows: Vec<&crate::config::Def> = DEFS.iter().filter(|d| d.tab == *tab).collect();
+                let tall = (0..TABS.len()).map(|t| DEFS.iter().filter(|d| d.tab == t).count()).max().unwrap_or(1) as u16;
+                let lw = DEFS.iter().map(|d| str_width(d.label)).max().unwrap_or(20) as u16;
+                let r = self.popup(cv, l, (w, h), (lw + 52, tall + 8), "Settings");
+                let lim = r.x + r.w;
+                let on_st = Style { fg: l.theme.color("green").or(text.fg), ..text };
+                let dim = Style { bg: l.popup.bg, ..l.count };
+                // the tabs, in the middle: the open one bright, the others on the field's background
+                // (the chips of the program's own tab bar: the open one in the footer's label colour, the others in its key colour, a hairline between)
+                let chips: Vec<String> = TABS.iter().enumerate().map(|(i, name)| format!("  {} {name}  ", i + 1)).collect();
+                let total = chips.iter().map(|c| str_width(c)).sum::<usize>() as u16 + chips.len().saturating_sub(1) as u16;
+                let mut x = r.x + r.w.saturating_sub(total) / 2;
+                for (i, chip) in chips.iter().enumerate() {
+                    let st = if i == *tab { l.footer_label } else { l.footer_key };
+                    if i > 0 {
+                        x = hairline(cv, x, r.y, l.popup.bg, &st, lim);
+                    }
+                    x = cv.put(x, r.y, chip, st, lim);
+                }
+                let vcol = r.x + 1 + lw + 2;
+                for (i, d) in rows.iter().enumerate() {
+                    let y = r.y + 2 + i as u16;
+                    let row = if i == *sel { l.sel[0] } else { text };
+                    cv.fill(Rect { x: r.x, y, w: r.w, h: 1 }, row);
+                    let v = self.cfg.get(d.id);
+                    let fixed = self.cfg.fixed.iter().any(|f| f == d.key());
+                    let colour = if d.id == "notifications" { LEVELS[self.cfg.notify_min.min(5)].3 } else { "yellow" };
+                    let lst = if i == *sel { row } else { text };
+                    if let Kind::Bool = d.kind {
+                        let tst = if i == *sel { row } else if v == "on" { on_st } else { dim };
+                        // the tick stands in the column of the values
+                        cv.put(r.x + 1, y, d.label, lst, lim);
+                        cv.put(vcol + 2, y, if v == "on" { "[x]" } else { "[ ]" }, tst, lim);
+                    } else {
+                        cv.put(r.x + 1, y, d.label, lst, lim);
+                        let vst = if i == *sel { row } else { tint(l, colour, text, text.bg) };
+                        let ast = if i == *sel { row } else { dim };
+                        let x = cv.put(vcol, y, "\u{2039} ", ast, lim);
+                        let x = cv.put(x, y, &v, vst, lim);
+                        cv.put(x, y, " \u{203a}", ast, lim);
+                    }
+                    // when it takes effect, or that config.toml has it
+                    let note = if fixed { "(config.toml)".to_string() } else if !d.when.is_empty() { format!("{} \u{f021}", d.when) } else { String::new() };
+                    if !note.is_empty() {
+                        let nx = lim.saturating_sub(str_width(&note) as u16 + 1);
+                        // the note in colour: orange for what waits, the dim colour for what config.toml fixes
+                        let nst = if fixed { Style { bg: row.bg, ..l.count } } else if i == *sel { row } else { tint(l, "orange", text, text.bg) };
+                        cv.put(nx, y, &note, nst, lim);
+                    }
+                }
+                // what the row is for
+                if let Some(d) = rows.get(*sel) {
+                    cv.put(r.x, r.y + 3 + tall, &truncate(d.help, r.w as usize), dim, lim);
+                }
+                hints(cv, l, r.x, r.y + 5 + tall, lim, &[("j/k", "choose"), ("h/l", "change"), ("Tab", "next tab"), ("Esc", "close")]);
             }
             Dialog::Owner { paths, users, groups, user, group, members, focus, open, .. } => {
                 let title = format!("Owner · {} item(s)", paths.len());

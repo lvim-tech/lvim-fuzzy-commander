@@ -78,6 +78,155 @@ pub struct Config {
     /// `[plugins.<name>]`: lvc's own overrides of the plugins' settings (the layer over the plugin's defaults and
     /// the shared `~/.config/lvim-plugins/<name>.toml`).
     pub plugins: toml::Table,
+    /// The lowest level of notification that shows as a card (an index of `LEVEL_NAMES`): that level and the ones above it show. The list of
+    /// notifications (`oi`) keeps them all.
+    pub notify_min: usize,
+    /// How many cards are on the screen at most, how many notifications the list keeps, and the seconds a card of each level stays.
+    pub notify_cards: usize,
+    pub notify_history: usize,
+    pub notify_secs: [u64; 6],
+    /// The settings of the panel that `config.toml` sets itself: the panel shows them as fixed there.
+    pub fixed: Vec<String>,
+}
+
+/// The names of the levels of a notification, in order.
+pub const LEVEL_NAMES: [&str; 6] = ["debug", "info", "status", "success", "warn", "error"];
+
+/// How a setting of the panel is changed.
+#[derive(Clone, Copy)]
+pub enum Kind {
+    Bool,
+    /// One of these (`<` / `>` step through them).
+    Choice(&'static [&'static str]),
+    /// A number between `min` and `max`, stepped by `step`.
+    Num { min: i64, max: i64, step: i64 },
+    /// The editors that are installed (and the one set).
+    Editor,
+    /// The themes in the themes folder (and the one set).
+    Theme,
+}
+
+/// One setting of the panel (`oS`): `id` is its key in the settings file (`a.b` is `b` in the table `a`), `tab` the tab it is on, `when` says when a
+/// change takes effect ("" at once).
+pub struct Def {
+    pub id: &'static str,
+    pub tab: usize,
+    pub label: &'static str,
+    pub kind: Kind,
+    pub when: &'static str,
+    pub help: &'static str,
+}
+
+impl Def {
+    /// The key of the file this setting is under.
+    pub fn key(&self) -> &str {
+        self.id.split('.').next().unwrap_or(self.id)
+    }
+}
+
+pub const TABS: [&str; 4] = ["General", "Files", "Notifications", "Display"];
+
+const SECS: Kind = Kind::Num { min: 1, max: 60, step: 1 };
+
+pub const DEFS: &[Def] = &[
+    Def { id: "editor", tab: 0, label: "editor", kind: Kind::Editor, when: "", help: "the program F4 / e opens files with" },
+    Def { id: "preview", tab: 0, label: "preview", kind: Kind::Choice(&["nvim", "file", "off"]), when: "next start", help: "nvim: Neovim shows the file; file: the plain text; off: no preview" },
+    Def { id: "pool", tab: 0, label: "keep a Neovim ready", kind: Kind::Bool, when: "next preview", help: "a Neovim waits so the next preview opens at once" },
+    Def { id: "key_hints", tab: 0, label: "key hints after Ctrl-c", kind: Kind::Bool, when: "", help: "the bar of the keys that follow a leader key (v H)" },
+    Def { id: "theme", tab: 0, label: "theme", kind: Kind::Theme, when: "next start", help: "a theme of ~/.config/lvim-commander/themes" },
+    Def { id: "hidden", tab: 1, label: "hidden files", kind: Kind::Bool, when: "", help: "show the files that start with a dot (v h in a panel)" },
+    Def { id: "delete", tab: 1, label: "delete goes to", kind: Kind::Choice(&["trash", "direct"]), when: "", help: "trash: recoverable; direct: gone at once" },
+    Def { id: "clipboard_files", tab: 1, label: "copy files to the desktop clipboard", kind: Kind::Bool, when: "", help: "yy / yx also put the files themselves in it, so a browser or a file manager can paste them" },
+    Def { id: "watch", tab: 1, label: "follow changes made outside", kind: Kind::Bool, when: "next start", help: "the panels refresh when another program changes a folder they show" },
+    Def { id: "notifications", tab: 2, label: "show from the level", kind: Kind::Choice(&LEVEL_NAMES), when: "", help: "that level and the ones above it show as a card; the list (o i) keeps all" },
+    Def { id: "notification_cards", tab: 2, label: "cards on the screen at most", kind: Kind::Num { min: 1, max: 8, step: 1 }, when: "", help: "the oldest card goes when there are more" },
+    Def { id: "notification_history", tab: 2, label: "notifications the list keeps", kind: Kind::Num { min: 20, max: 1000, step: 20 }, when: "", help: "the list of o i" },
+    Def { id: "notification_seconds.debug", tab: 2, label: "seconds a debug card stays", kind: SECS, when: "", help: "" },
+    Def { id: "notification_seconds.info", tab: 2, label: "seconds an info card stays", kind: SECS, when: "", help: "" },
+    Def { id: "notification_seconds.status", tab: 2, label: "seconds a status card stays", kind: SECS, when: "", help: "a status becomes its result when that comes" },
+    Def { id: "notification_seconds.success", tab: 2, label: "seconds a success card stays", kind: SECS, when: "", help: "" },
+    Def { id: "notification_seconds.warn", tab: 2, label: "seconds a warn card stays", kind: SECS, when: "", help: "" },
+    Def { id: "notification_seconds.error", tab: 2, label: "seconds an error card stays", kind: SECS, when: "", help: "" },
+    Def { id: "icons", tab: 3, label: "file icons", kind: Kind::Choice(&["auto", "image", "font"]), when: "next start", help: "auto: Material images where the terminal takes them; image: always; font: Nerd Font glyphs" },
+    Def { id: "zellij_images", tab: 3, label: "images inside Zellij", kind: Kind::Bool, when: "next start", help: "for a Zellij build that takes kitty placeholders" },
+    Def { id: "image_transfer", tab: 3, label: "how a picture reaches the terminal", kind: Kind::Choice(&["file", "direct"]), when: "next start", help: "file: through a temporary file (fast); direct: the bytes through the terminal" },
+];
+
+/// Is `k` a key of the settings file of the panel?
+pub fn panel_key(k: &str) -> bool {
+    DEFS.iter().any(|d| d.key() == k)
+}
+
+impl Config {
+    /// The value of a setting of the panel, as text.
+    pub fn get(&self, id: &str) -> String {
+        let b = |v: bool| if v { "on" } else { "off" }.to_string();
+        match id {
+            "editor" => self.editor.clone(),
+            "preview" => match self.preview {
+                PreviewKind::Nvim => "nvim",
+                PreviewKind::File => "file",
+                PreviewKind::Off => "off",
+            }
+            .into(),
+            "pool" => b(self.pool),
+            "key_hints" => b(self.key_hints),
+            "theme" => self.theme.clone().unwrap_or_default(),
+            "hidden" => b(self.hidden),
+            "delete" => if self.delete == Delete::Direct { "direct" } else { "trash" }.into(),
+            "clipboard_files" => b(self.clipboard_files),
+            "watch" => b(self.watch),
+            "notifications" => LEVEL_NAMES[self.notify_min.min(5)].into(),
+            "notification_cards" => self.notify_cards.to_string(),
+            "notification_history" => self.notify_history.to_string(),
+            "icons" => match self.icons {
+                lvim_fuzzy_ui::iconimg::Mode::Auto => "auto",
+                lvim_fuzzy_ui::iconimg::Mode::Image => "image",
+                lvim_fuzzy_ui::iconimg::Mode::Font => "font",
+            }
+            .into(),
+            "zellij_images" => b(self.zellij_images),
+            "image_transfer" => if self.image_transfer_file { "file" } else { "direct" }.into(),
+            other => other
+                .strip_prefix("notification_seconds.")
+                .and_then(|l| LEVEL_NAMES.iter().position(|n| *n == l))
+                .map(|i| self.notify_secs[i].to_string())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Set a setting of the panel from its text (as `get` gives it).
+    pub fn set(&mut self, id: &str, v: &str) {
+        let on = v == "on";
+        match id {
+            "editor" => self.editor = v.into(),
+            "preview" => {
+                self.preview = match v {
+                    "file" => PreviewKind::File,
+                    "off" => PreviewKind::Off,
+                    _ => PreviewKind::Nvim,
+                }
+            }
+            "pool" => self.pool = on,
+            "key_hints" => self.key_hints = on,
+            "theme" => self.theme = Some(v.into()),
+            "hidden" => self.hidden = on,
+            "delete" => self.delete = if v == "direct" { Delete::Direct } else { Delete::Trash },
+            "clipboard_files" => self.clipboard_files = on,
+            "watch" => self.watch = on,
+            "notifications" => self.notify_min = LEVEL_NAMES.iter().position(|n| *n == v).unwrap_or(0),
+            "notification_cards" => self.notify_cards = v.parse().unwrap_or(4),
+            "notification_history" => self.notify_history = v.parse().unwrap_or(200),
+            "icons" => self.icons = lvim_fuzzy_ui::iconimg::Mode::parse(v).unwrap_or(lvim_fuzzy_ui::iconimg::Mode::Auto),
+            "zellij_images" => self.zellij_images = on,
+            "image_transfer" => self.image_transfer_file = v != "direct",
+            other => {
+                if let Some(i) = other.strip_prefix("notification_seconds.").and_then(|l| LEVEL_NAMES.iter().position(|n| *n == l)) {
+                    self.notify_secs[i] = v.parse().unwrap_or(3);
+                }
+            }
+        }
+    }
 }
 
 impl Default for Config {
@@ -102,6 +251,11 @@ impl Default for Config {
             actions: Vec::new(),
             previewers: Vec::new(),
             plugins: toml::Table::new(),
+            notify_min: 0,
+            notify_cards: 4,
+            notify_history: 200,
+            notify_secs: [2, 3, 3, 3, 6, 9],
+            fixed: Vec::new(),
             icons: lvim_fuzzy_ui::iconimg::Mode::Auto,
             zellij_images: true,
             image_transfer_file: true,
@@ -160,146 +314,47 @@ fn lvim_fuzzy_theme() -> Option<String> {
 
 /// Read the config; problems are returned to be shown (the defaults apply to what is wrong).
 pub fn load() -> (Config, Vec<String>) {
-    load_from(&path())
+    load_with(&path(), Some(settings_path()))
 }
 
 /// `load` from a given file.
+/// The config at `p` alone (no settings file under it).
+#[cfg(test)]
 pub fn load_from(p: &std::path::Path) -> (Config, Vec<String>) {
+    load_with(p, None)
+}
+
+/// The config at `p` over the settings the panel kept in `sp`.
+fn load_with(p: &std::path::Path, sp: Option<PathBuf>) -> (Config, Vec<String>) {
     let mut c = Config::default();
     let mut errs = Vec::new();
     let p = p.to_path_buf();
+    // what the settings panel kept: under the config, which wins
+    if let Some(sp) = sp
+        && let Ok(text) = std::fs::read_to_string(&sp)
+    {
+        match toml::from_str::<toml::Table>(&text) {
+            Err(e) => errs.push(format!("{}: {e}", sp.display())),
+            Ok(t) => {
+                for (k, val) in t {
+                    if panel_key(&k) {
+                        apply_key(&mut c, &k, val, &sp, &mut errs);
+                    } else {
+                        errs.push(format!("{}: `{k}` is not a setting of the panel ({})", sp.display(), "see the panel: oS"));
+                    }
+                }
+            }
+        }
+    }
     if let Ok(text) = std::fs::read_to_string(&p) {
         match toml::from_str::<toml::Table>(&text) {
             Err(e) => errs.push(format!("{}: {e}", p.display())),
             Ok(t) => {
                 for (k, val) in t {
-                    let bad = |errs: &mut Vec<String>, what: &str| {
-                        errs.push(format!("{}: `{k}` must be {what}", p.display()))
-                    };
-                    match k.as_str() {
-                        "theme" => match val.as_str() {
-                            Some(s) => c.theme = Some(s.into()),
-                            None => bad(&mut errs, "a string"),
-                        },
-                        "delete" => match val.as_str() {
-                            Some("trash") => c.delete = Delete::Trash,
-                            Some("direct") => c.delete = Delete::Direct,
-                            _ => bad(&mut errs, "\"trash\" or \"direct\""),
-                        },
-                        "watch" => match val.as_bool() {
-                            Some(b) => c.watch = b,
-                            None => bad(&mut errs, "true or false"),
-                        },
-                        "key_hints" => match val.as_bool() {
-                            Some(b) => c.key_hints = b,
-                            None => bad(&mut errs, "true or false"),
-                        },
-                        "hidden" => match val.as_bool() {
-                            Some(b) => c.hidden = b,
-                            None => bad(&mut errs, "true or false"),
-                        },
-                        "editor" => match val.as_str() {
-                            Some(s) => c.editor = s.into(),
-                            None => bad(&mut errs, "a string"),
-                        },
-                        "preview" => match val.as_str() {
-                            Some("nvim") => c.preview = PreviewKind::Nvim,
-                            Some("file") => c.preview = PreviewKind::File,
-                            Some("off") => c.preview = PreviewKind::Off,
-                            _ => bad(&mut errs, "\"nvim\", \"file\" or \"off\""),
-                        },
-                        "nvim" => match val.as_str() {
-                            Some(s) => c.nvim = s.into(),
-                            None => bad(&mut errs, "a string"),
-                        },
-                        "pool" => match val.as_bool() {
-                            Some(b) => c.pool = b,
-                            None => bad(&mut errs, "true or false"),
-                        },
-                        "git" | "git_ignored" => errs.push(format!(
-                            "{}: `{k}` is gone: git is the git plugin's now — install it with its `scripts/install.sh` and set `ignored` / `untracked` in its configuration",
-                            p.display()
-                        )),
-                        "clipboard_files" => match val.as_bool() {
-                            Some(b) => c.clipboard_files = b,
-                            None => bad(&mut errs, "true or false"),
-                        },
-                        "open" => errs.push(format!(
-                            "{}: [open] is gone: which program opens a file is the open plugin's configuration now — \
-                             [plugins.lvim-fuzzy-plugin-open.types.<group>] (ext / mime / kind, engine) and \
-                             [plugins.lvim-fuzzy-plugin-open.engines.<name>] (kind = \"command\", command = \"imv {{}}\")",
-                            p.display()
-                        )),
-                        "bookmarks" => match val.as_table() {
-                            Some(m) => {
-                                for (name, dir) in m {
-                                    match dir.as_str() {
-                                        Some(s) => {
-                                            c.bookmarks.insert(name.clone(), s.into());
-                                        }
-                                        None => errs.push(format!(
-                                            "{}: bookmarks.{name} must be a directory string",
-                                            p.display()
-                                        )),
-                                    }
-                                }
-                            }
-                            None => bad(&mut errs, "a table"),
-                        },
-                        "icons" => match val.as_str().and_then(lvim_fuzzy_ui::iconimg::Mode::parse) {
-                            Some(m) => c.icons = m,
-                            None => bad(&mut errs, "\"auto\", \"image\" or \"font\""),
-                        },
-                        "image_transfer" => match val.as_str() {
-                            Some("file") => c.image_transfer_file = true,
-                            Some("direct") => c.image_transfer_file = false,
-                            _ => bad(&mut errs, "\"file\" or \"direct\""),
-                        },
-                        "zellij_images" => match val.as_bool() {
-                            Some(b) => c.zellij_images = b,
-                            None => bad(&mut errs, "true or false"),
-                        },
-                        "leader" => errs.push(format!(
-                            "{}: `leader` is gone: commands are key groups now (t tabs, m marks, a actions, y copy, f find, g go, v view); F1 or g? lists them",
-                            p.display()
-                        )),
-                        "keys" => match val.as_table() {
-                            Some(m) => {
-                                for (name, key) in m {
-                                    // a place in the groups (`"v z"`, `"x a a"`): a button moved
-                                    if let Some(pos) = key.as_str().and_then(crate::app::parse_pos) {
-                                        c.positions.push((name.clone(), pos));
-                                        continue;
-                                    }
-                                    // (a name that is no command is a plugin / config action: checked once the plugins are loaded)
-                                    match key.as_str().and_then(crate::plugins::KeySpec::parse).filter(|k| !k.chord) {
-                                        Some(ks) => c.keys.push((name.clone(), ks)),
-                                        None => errs.push(format!(
-                                            "{}: keys.{name}: a key like \"f5\", \"shift-f8\", \"alt-x\", or a place in the groups like \"v z\" or \"x a a\"",
-                                            p.display()
-                                        )),
-                                    }
-                                }
-                            }
-                            None => bad(&mut errs, "a table: action = \"key\""),
-                        },
-                        "actions" => {
-                            let at = p.display().to_string();
-                            c.actions = crate::plugins::parse_actions(&val, "config", None, crate::plugins::Runtime::Command, &at, &mut errs);
-                        }
-                        "previewers" => {
-                            let at = p.display().to_string();
-                            c.previewers = crate::plugins::parse_previewers(&val, None, &at, &mut errs);
-                        }
-                        "plugins" => match val.as_table() {
-                            Some(t) if t.values().all(|x| x.is_table()) => c.plugins = t.clone(),
-                            _ => bad(&mut errs, "a table of tables: [plugins.<plugin name>]"),
-                        },
-                        other => errs.push(format!(
-                            "{}: unknown key `{other}` (theme, keys, delete, hidden, editor, preview, nvim, pool, clipboard_files, icons, zellij_images, bookmarks, actions, previewers, plugins)",
-                            p.display()
-                        )),
+                    if panel_key(&k) {
+                        c.fixed.push(k.clone());
                     }
+                    apply_key(&mut c, &k, val, &p, &mut errs);
                 }
             }
         }
@@ -308,6 +363,163 @@ pub fn load_from(p: &std::path::Path) -> (Config, Vec<String>) {
         c.theme = lvim_fuzzy_theme();
     }
     (c, errs)
+}
+
+/// One `key = value` of a settings file (the config, or the panel's).
+fn apply_key(c: &mut Config, k: &str, val: toml::Value, p: &std::path::Path, errs: &mut Vec<String>) {
+    let bad = |errs: &mut Vec<String>, what: &str| errs.push(format!("{}: `{k}` must be {what}", p.display()));
+    match k {
+        "theme" => match val.as_str() {
+            Some(s) => c.theme = Some(s.into()),
+            None => bad(errs, "a string"),
+        },
+        "delete" => match val.as_str() {
+            Some("trash") => c.delete = Delete::Trash,
+            Some("direct") => c.delete = Delete::Direct,
+            _ => bad(errs, "\"trash\" or \"direct\""),
+        },
+        "watch" => match val.as_bool() {
+            Some(b) => c.watch = b,
+            None => bad(errs, "true or false"),
+        },
+        "key_hints" => match val.as_bool() {
+            Some(b) => c.key_hints = b,
+            None => bad(errs, "true or false"),
+        },
+        "hidden" => match val.as_bool() {
+            Some(b) => c.hidden = b,
+            None => bad(errs, "true or false"),
+        },
+        "editor" => match val.as_str() {
+            Some(s) => c.editor = s.into(),
+            None => bad(errs, "a string"),
+        },
+        "preview" => match val.as_str() {
+            Some("nvim") => c.preview = PreviewKind::Nvim,
+            Some("file") => c.preview = PreviewKind::File,
+            Some("off") => c.preview = PreviewKind::Off,
+            _ => bad(errs, "\"nvim\", \"file\" or \"off\""),
+        },
+        "nvim" => match val.as_str() {
+            Some(s) => c.nvim = s.into(),
+            None => bad(errs, "a string"),
+        },
+        "pool" => match val.as_bool() {
+            Some(b) => c.pool = b,
+            None => bad(errs, "true or false"),
+        },
+        "git" | "git_ignored" => errs.push(format!(
+            "{}: `{k}` is gone: git is the git plugin's now — install it with its `scripts/install.sh` and set `ignored` / `untracked` in its configuration",
+            p.display()
+        )),
+        // (an early panel kept a list of the levels that show: the lowest of them is the level now)
+        "notifications" if val.is_array() => {
+            let low = val.as_array().and_then(|a| a.iter().filter_map(|v| v.as_str().and_then(|n| LEVEL_NAMES.iter().position(|l| *l == n))).min());
+            c.notify_min = low.unwrap_or(0);
+        }
+        "notifications" => match val.as_str().and_then(|n| LEVEL_NAMES.iter().position(|l| *l == n)) {
+            Some(i) => c.notify_min = i,
+            None => bad(errs, "the lowest level that shows: debug, info, status, success, warn or error"),
+        },
+        "notification_cards" => match val.as_integer().filter(|n| (1..=8).contains(n)) {
+            Some(n) => c.notify_cards = n as usize,
+            None => bad(errs, "a number from 1 to 8"),
+        },
+        "notification_history" => match val.as_integer().filter(|n| (20..=1000).contains(n)) {
+            Some(n) => c.notify_history = n as usize,
+            None => bad(errs, "a number from 20 to 1000"),
+        },
+        "notification_seconds" => match val.as_table() {
+            Some(t) => {
+                for (level, secs) in t {
+                    match (LEVEL_NAMES.iter().position(|n| n == level), secs.as_integer().filter(|n| (1..=60).contains(n))) {
+                        (Some(i), Some(n)) => c.notify_secs[i] = n as u64,
+                        _ => errs.push(format!("{}: notification_seconds.{level} must be a number of seconds, 1 to 60, of a level (debug info status success warn error)", p.display())),
+                    }
+                }
+            }
+            None => bad(errs, "a table: debug = 2, warn = 6, …"),
+        },
+        "clipboard_files" => match val.as_bool() {
+            Some(b) => c.clipboard_files = b,
+            None => bad(errs, "true or false"),
+        },
+        "open" => errs.push(format!(
+            "{}: [open] is gone: which program opens a file is the open plugin's configuration now — \
+             [plugins.lvim-fuzzy-plugin-open.types.<group>] (ext / mime / kind, engine) and \
+             [plugins.lvim-fuzzy-plugin-open.engines.<name>] (kind = \"command\", command = \"imv {{}}\")",
+            p.display()
+        )),
+        "bookmarks" => match val.as_table() {
+            Some(m) => {
+                for (name, dir) in m {
+                    match dir.as_str() {
+                        Some(s) => {
+                            c.bookmarks.insert(name.clone(), s.into());
+                        }
+                        None => errs.push(format!(
+                            "{}: bookmarks.{name} must be a directory string",
+                            p.display()
+                        )),
+                    }
+                }
+            }
+            None => bad(errs, "a table"),
+        },
+        "icons" => match val.as_str().and_then(lvim_fuzzy_ui::iconimg::Mode::parse) {
+            Some(m) => c.icons = m,
+            None => bad(errs, "\"auto\", \"image\" or \"font\""),
+        },
+        "image_transfer" => match val.as_str() {
+            Some("file") => c.image_transfer_file = true,
+            Some("direct") => c.image_transfer_file = false,
+            _ => bad(errs, "\"file\" or \"direct\""),
+        },
+        "zellij_images" => match val.as_bool() {
+            Some(b) => c.zellij_images = b,
+            None => bad(errs, "true or false"),
+        },
+        "leader" => errs.push(format!(
+            "{}: `leader` is gone: commands are key groups now (t tabs, m marks, a actions, y copy, f find, g go, v view); F1 or g? lists them",
+            p.display()
+        )),
+        "keys" => match val.as_table() {
+            Some(m) => {
+                for (name, key) in m {
+                    // a place in the groups (`"v z"`, `"x a a"`): a button moved
+                    if let Some(pos) = key.as_str().and_then(crate::app::parse_pos) {
+                        c.positions.push((name.clone(), pos));
+                        continue;
+                    }
+                    // (a name that is no command is a plugin / config action: checked once the plugins are loaded)
+                    match key.as_str().and_then(crate::plugins::KeySpec::parse).filter(|k| !k.chord) {
+                        Some(ks) => c.keys.push((name.clone(), ks)),
+                        None => errs.push(format!(
+                            "{}: keys.{name}: a key like \"f5\", \"shift-f8\", \"alt-x\", or a place in the groups like \"v z\" or \"x a a\"",
+                            p.display()
+                        )),
+                    }
+                }
+            }
+            None => bad(errs, "a table: action = \"key\""),
+        },
+        "actions" => {
+            let at = p.display().to_string();
+            c.actions = crate::plugins::parse_actions(&val, "config", None, crate::plugins::Runtime::Command, &at, errs);
+        }
+        "previewers" => {
+            let at = p.display().to_string();
+            c.previewers = crate::plugins::parse_previewers(&val, None, &at, errs);
+        }
+        "plugins" => match val.as_table() {
+            Some(t) if t.values().all(|x| x.is_table()) => c.plugins = t.clone(),
+            _ => bad(errs, "a table of tables: [plugins.<plugin name>]"),
+        },
+        other => errs.push(format!(
+            "{}: unknown key `{other}` (theme, keys, delete, hidden, notifications, key_hints, editor, preview, nvim, pool, clipboard_files, icons, zellij_images, bookmarks, actions, previewers, plugins)",
+            p.display()
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -462,6 +674,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("tasks", "leader !"),
     ("cd", "leader P"),
     ("notifications", "leader T"),
+    ("settings", "leader C"),
     ("compare", "leader ="),
     ("yank", "leader @"),
     ("cut", "leader #"),
@@ -628,6 +841,40 @@ impl Cols {
         }
         c
     }
+}
+
+/// `$XDG_STATE_HOME/lvim-commander/settings.toml`: what the settings panel (`oS`) keeps. `config.toml` wins over it.
+pub fn settings_path() -> PathBuf {
+    state_path().with_file_name("settings.toml")
+}
+
+/// The panel's settings written down (all but what `config.toml` fixes).
+pub fn save_settings(c: &Config) -> Result<(), String> {
+    let mut t = toml::Table::new();
+    for d in DEFS.iter().filter(|d| !c.fixed.iter().any(|f| f == d.key())) {
+        let v = c.get(d.id);
+        let val = match d.kind {
+            Kind::Bool => toml::Value::Boolean(v == "on"),
+            Kind::Num { .. } => toml::Value::Integer(v.parse().unwrap_or(0)),
+            _ => toml::Value::String(v),
+        };
+        match d.id.split_once('.') {
+            Some((table, key)) => {
+                let e = t.entry(table).or_insert_with(|| toml::Value::Table(toml::Table::new()));
+                if let Some(tt) = e.as_table_mut() {
+                    tt.insert(key.into(), val);
+                }
+            }
+            None => {
+                t.insert(d.id.into(), val);
+            }
+        }
+    }
+    let path = settings_path();
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+    }
+    std::fs::write(&path, format!("# written by lvc's settings panel (oS); config.toml wins over it\n{t}")).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 fn state_path() -> PathBuf {
