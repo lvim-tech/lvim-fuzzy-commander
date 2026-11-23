@@ -71,6 +71,8 @@ impl Term {
         };
         terminal::enable_raw_mode()?;
         execute!(out, terminal::EnterAlternateScreen, cursor::Hide, EnableMouseCapture)?;
+        lvim_fuzzy_ui::keyboard::push(&mut out);
+        out.flush()?;
         // Zellij: our pane takes the Ctrl-h / j / k / l of lvim-winnav while lvc shows
         crate::mux::mark(true);
         Ok(Term {
@@ -113,6 +115,7 @@ impl Term {
         pause_input();
         // the program run marks the pane itself if it wants the nav keys (Neovim does)
         crate::mux::mark(false);
+        lvim_fuzzy_ui::keyboard::pop(&mut self.out);
         queue!(
             self.out,
             DisableMouseCapture,
@@ -138,6 +141,7 @@ impl Term {
         INPUT_ON.store(true, std::sync::atomic::Ordering::Release);
         crate::mux::mark(true);
         queue!(self.out, cursor::Hide, EnableMouseCapture)?;
+        lvim_fuzzy_ui::keyboard::push(&mut self.out);
         self.out.flush()?;
         if let Ok((w, h)) = terminal::size() {
             self.resize(w, h);
@@ -156,6 +160,7 @@ impl Term {
             cursor::Hide,
             EnableMouseCapture
         )?;
+        lvim_fuzzy_ui::keyboard::push(&mut self.out);
         self.out.flush()?;
         // kitty drops an alternate screen's images when the screen is switched: the icons (and a preview's picture)
         // are sent again as they are drawn
@@ -174,6 +179,7 @@ impl Drop for Term {
         // the icon images go with the program
         let _ = self.out.write_all(&lvim_fuzzy_ui::iconimg::cleanup());
         lvim_fuzzy_ui::media::cleanup_files();
+        lvim_fuzzy_ui::keyboard::pop(&mut self.out);
         let _ = queue!(
             self.out,
             DisableMouseCapture,

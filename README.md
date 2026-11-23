@@ -370,6 +370,14 @@ string (a message) or a list of instruction tables. Calls run on a thread of the
 256 MB. A Lua plugin has the Lua standard library (files, `os.execute`) with your rights, as a shell-script
 plugin has — for a sandbox use `wasm`. `lvim-plugin/examples/plugins/lua/` is one.
 
+## Printing the choice
+
+`Shift-Enter` (or `op`) leaves lvc printing the folder of the choice — the marked entries, or the one under the cursor (of a file: the folder it is in),
+else the folder shown — so `cd "$(lvc --print-dir)"` goes there. To have `lvc` itself change the directory of your shell (a program cannot do that to
+its parent) put `eval "$(lvc --zsh)"` in `~/.zshrc` (`--bash` for bash): then `lvc` — or `lvcd` — does it, also on a plain quit (the folder it was left
+in). `Shift-Enter` needs a terminal that tells it apart from Enter (kitty and the like; lvc asks for the keyboard protocol,
+`LVIM_KEYBOARD_PROTOCOL=0` turns that off); `op` works everywhere, and the key can be moved with `[keys]` (`cd = "leader P"`). `ot` lists the notifications.
+
 ## Several instances
 
 ```sh

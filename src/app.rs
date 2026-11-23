@@ -203,6 +203,7 @@ enum MenuItem {
     Dir(PathBuf),
     /// A line of the list of notifications (nothing to do with it).
     Note,
+    /// A way to print the choice (the output menu): the letter of the form; Enter does it and lvc ends.
     /// An index into `App::actions`.
     Action(usize),
     /// A built-in operation (the F9 menu lists them before the user actions).
@@ -256,6 +257,8 @@ enum Builtin {
     Undo,
     Reload,
     Notifications,
+    /// Print the folder of the choice (the marked entries, or the one under the cursor) and leave: `cd "$(lvc)"`.
+    Cd,
     Help,
 }
 
@@ -296,6 +299,8 @@ const CHORDS: &[(&str, &str, u8, &str)] = &[
     ("U", "redo", 0, "redo"),
     ("/", "sync browsing", 0, "sync"),
     ("!", "tasks", 0, "tasks"),
+    ("P", "cd to the choice", 0, "cd"),
+    ("T", "notifications", 0, "notifications"),
     ("=", "compare", 1, "compare"),
     ("@", "copy files", 1, "yank"),
     ("#", "cut files", 1, "cut"),
@@ -358,7 +363,7 @@ pub const GROUPS: &[(char, &str, &[(&str, &str)])] = &[
     ]),
     ('o', "operations", &[
         ("c", "copy"), ("m", "move"), ("r", "refresh"), ("R", "rename-tab"), ("N", "rename"), ("s", "here-to-other"), ("n", "new"), ("e", "edit"), ("d", "trash"), ("D", "delete"),
-        ("o", "menu"), ("t", "tasks"),
+        ("o", "menu"), ("t", "tasks"), ("p", "cd"), ("i", "notifications"),
     ]),
     ('b', "bookmarks", &[("a", "bookmark-add"), ("d", "bookmark-delete"), ("l", "bookmarks"), ("r", "bookmark-rename")]),
     ('v', "view", &[
@@ -578,7 +583,8 @@ const BUILTINS: &[(Builtin, &str, &str)] = &[
     (Builtin::Swap, "Swap the panels", "v w"),
     (Builtin::Undo, "Undo", "a u"),
     (Builtin::Reload, "Reload", "v r"),
-    (Builtin::Notifications, "Notifications", "o N"),
+    (Builtin::Notifications, "Notifications", "o i"),
+    (Builtin::Cd, "Leave in the folder of the choice (cd)", "o p"),
     (Builtin::Help, "Keys", "?"),
 ];
 
@@ -643,6 +649,8 @@ struct Toast {
 /// What the program prints when it ends (`--print-dir`).
 pub struct Outcome {
     pub dir: Option<PathBuf>,
+    /// What the output menu chose to print (one per line), when it was used.
+    pub print: Vec<String>,
 }
 
 pub struct App {
@@ -762,6 +770,8 @@ pub struct App {
     list_rects: [Rect; 2],
     last_click: Option<(Instant, usize, usize)>,
     quit: bool,
+    /// The output menu: what it chose to print (lvc ends and main prints it), and the choice it was opened on.
+    print_out: Option<Vec<String>>,
     /// The user actions (config `[actions]` + plugins) and previewers.
     actions: Vec<crate::plugins::Action>,
     previewers: Vec<crate::plugins::Previewer>,
@@ -878,6 +888,7 @@ impl App {
             list_rects: [Rect { x: 0, y: 0, w: 0, h: 0 }; 2],
             last_click: None,
             quit: false,
+            print_out: None,
             actions,
             previewers,
             act_tx,
@@ -990,6 +1001,22 @@ impl App {
             self.notes.remove(0);
         }
         self.notes.push(t);
+    }
+
+    /// Shift-Enter / `op`: leave printing the folder of the choice — the marked entries, or the one under the cursor (of a file: its folder), else
+    /// the folder shown — so `cd "$(lvc)"` (or the shell function) goes there.
+    fn cd_choice(&mut self) {
+        if self.p().remote().is_some() {
+            self.toast("cd prints a folder of this machine: not on a remote", false);
+            return;
+        }
+        let base = self.p().dir().map(Path::to_path_buf).unwrap_or_else(fsx::home);
+        let mut lines: Vec<String> = self.p().targets().iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        if lines.is_empty() {
+            lines.push(base.to_string_lossy().into_owned());
+        }
+        self.print_out = Some(lines.iter().map(|l| lvim_fuzzy_ui::printas::folder(l, &base)).collect());
+        self.quit = true;
     }
 
     /// `oo` → Notifications: what plugins told, the newest first.
@@ -1144,6 +1171,7 @@ impl App {
         self.stop_procs();
         Ok(Outcome {
             dir: self.p().dir().map(Path::to_path_buf),
+            print: self.print_out.take().unwrap_or_default(),
         })
     }
 
@@ -1904,6 +1932,8 @@ impl App {
                 let n = self.p().shown.len();
                 self.pm().cursor = n.saturating_sub(1);
             }
+            // Shift-Enter: leave in the folder of the choice (a terminal that tells it apart: kitty and the like)
+            KeyCode::Enter if k.modifiers.contains(KeyModifiers::SHIFT) => self.cd_choice(),
             KeyCode::Enter => self.open_current(term)?,
             KeyCode::Left | KeyCode::Char('[') if chord => self.pm().back_in_history(),
             KeyCode::Right | KeyCode::Char(']') if chord => self.pm().forward_in_history(),
@@ -1994,6 +2024,8 @@ impl App {
                     self.dialog = Some(Dialog::Tasks { sel: 0 });
                 }
             }
+            KeyCode::Char('P') if chord => self.cd_choice(),
+            KeyCode::Char('T') if chord => self.notifications(),
             KeyCode::Char('=') if chord => self.compare_panels(),
             KeyCode::Char('@') if chord => self.yank(false),
             KeyCode::Char('#') if chord => self.yank(true),
@@ -4399,6 +4431,7 @@ impl App {
                 }
             }
             Builtin::Notifications => self.notifications(),
+            Builtin::Cd => self.cd_choice(),
             Builtin::Help => {
                 self.help = true;
                 self.help_sel = 0;

@@ -43,8 +43,9 @@ Keys: F1 inside. Config: ~/.config/lvim-commander/config.toml ($LVIM_COMMANDER_C
 ";
 
 fn shell_snippet() -> &'static str {
-    "# lvcd: lvim-fuzzy-commander, then cd to the directory it was left in\n\
-lvcd() {\n  local d\n  d=\"$(command lvim-fuzzy-commander --print-dir \"$@\")\" && [ -n \"$d\" ] && [ -d \"$d\" ] && cd -- \"$d\"\n}\n"
+    // lvc prints the folder it was left in (or Shift-Enter's folder of the choice): the function changes to it
+    "# lvcd: lvim-fuzzy-commander, then cd to where it was left (or to the folder Shift-Enter chose)\n\
+lvcd() {\n  local d\n  d=\"$(command lvim-fuzzy-commander --print-dir \"$@\")\" || return\n  d=\"${d%%$'\\n'*}\"\n  [ -d \"$d\" ] && cd -- \"$d\"\n}\n# `lvc` itself does the same, so there is one name to type\nlvc() { lvcd \"$@\"; }\n"
 }
 
 fn main() {
@@ -282,7 +283,12 @@ fn main() {
     drop(term);
     match out {
         Ok(o) => {
-            if print_dir && let Some(d) = o.dir {
+            // what cd chose to print; else, with --print-dir, the directory it was left in
+            if !o.print.is_empty() {
+                for l in &o.print {
+                    println!("{l}");
+                }
+            } else if print_dir && let Some(d) = o.dir {
                 println!("{}", d.display());
             }
         }

@@ -460,6 +460,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("sync", "leader /"),
     ("subshell", "leader {"),
     ("tasks", "leader !"),
+    ("cd", "leader P"),
+    ("notifications", "leader T"),
     ("compare", "leader ="),
     ("yank", "leader @"),
     ("cut", "leader #"),
