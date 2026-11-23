@@ -388,12 +388,14 @@ lvc --send all reload
 
 ## Leaving in another directory
 
-`lvc --print-dir` prints the active panel's directory when it ends. `lvc --zsh` (or `--bash`) prints a
-shell function for that:
+`lvc --print-dir` prints the active panel's directory when it ends. `lvc --zsh` (or `--bash`) prints a shell function (`lvc` and `lvcd`):
 
 ```sh
-eval "$(lvc --zsh)"   # ~/.zshrc: then `lvcd` opens lvc and cds to where you left it
+eval "$(lvc --zsh)"   # ~/.zshrc: then `lvc` opens lvc, and Shift-Enter in it leaves your shell in the folder of the choice
 ```
+
+Quitting normally leaves the shell where it was. To have it go to the folder lvc was in too, turn on **quitting changes the shell's folder** in the
+settings panel (`o S`, tab Files; `cd_on_quit = true` in the config). The function does not touch lvc's output: an editor lvc starts keeps the terminal.
 
 ## State
 
@@ -403,7 +405,7 @@ eval "$(lvc --zsh)"   # ~/.zshrc: then `lvcd` opens lvc and cds to where you lef
 ## Settings
 
 `o S` (or `Ctrl-c C`) opens the **settings panel**: the settings that are worth changing while you work, in four tabs — **General** (editor, preview,
-a Neovim kept ready, key hints, theme), **Files** (hidden files, where delete goes, the desktop clipboard for `yy` / `yx`, following changes made
+a Neovim kept ready, key hints, theme), **Files** (hidden files, where delete goes, whether quitting changes the shell's folder, the desktop clipboard for `yy` / `yx`, following changes made
 outside), **Notifications** (the lowest level that shows as a card — `warn` shows warn and error —, how many cards at most, how many notifications the
 list `o i` keeps, the seconds a card of each level stays) and **Display** (file icons, images inside Zellij, how a picture reaches the terminal).
 `Tab` / `Shift-Tab` (or `[` `]`, or `1`–`4`) change the tab, `j` / `k` the row, `h` / `l` (or `Space`) the value. A change takes effect at once where it
@@ -419,6 +421,7 @@ show as a card is still in the list of `o i`.
 theme   = "LvimEverforest_dark"  # an lvim theme; default: lvim-fuzzy's (~/.config/lvim-fuzzy)
 delete  = "trash"                # od, Delete: "trash" | "direct"
 hidden  = false                  # show dotfiles at start
+cd_on_quit = false               # with the shell function: quitting also changes the shell to the folder lvc was in (Shift-Enter always does)
 key_hints = true                 # the bar of key groups at the bottom (v H toggles it)
 watch   = true                   # show at once what other programs change in the shown directories
 editor  = "nvim"                 # default: $VISUAL, $EDITOR, nvim

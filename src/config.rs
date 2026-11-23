@@ -85,6 +85,8 @@ pub struct Config {
     pub notify_cards: usize,
     pub notify_history: usize,
     pub notify_secs: [u64; 6],
+    /// With the shell function (`lvc --zsh`): quitting also changes the shell to the folder lvc was in. Off: only Shift-Enter does (the folder of the choice).
+    pub cd_on_quit: bool,
     /// The settings of the panel that `config.toml` sets itself: the panel shows them as fixed there.
     pub fixed: Vec<String>,
 }
@@ -134,6 +136,7 @@ pub const DEFS: &[Def] = &[
     Def { id: "pool", tab: 0, label: "keep a Neovim ready", kind: Kind::Bool, when: "next preview", help: "a Neovim waits so the next preview opens at once" },
     Def { id: "key_hints", tab: 0, label: "key hints after Ctrl-c", kind: Kind::Bool, when: "", help: "the bar of the keys that follow a leader key (v H)" },
     Def { id: "theme", tab: 0, label: "theme", kind: Kind::Theme, when: "next start", help: "a theme of ~/.config/lvim-commander/themes" },
+    Def { id: "cd_on_quit", tab: 1, label: "quitting changes the shell's folder", kind: Kind::Bool, when: "", help: "with the shell function (lvc --zsh): the shell goes to the folder lvc was in; off: only Shift-Enter changes it" },
     Def { id: "hidden", tab: 1, label: "hidden files", kind: Kind::Bool, when: "", help: "show the files that start with a dot (v h in a panel)" },
     Def { id: "delete", tab: 1, label: "delete goes to", kind: Kind::Choice(&["trash", "direct"]), when: "", help: "trash: recoverable; direct: gone at once" },
     Def { id: "clipboard_files", tab: 1, label: "copy files to the desktop clipboard", kind: Kind::Bool, when: "", help: "yy / yx also put the files themselves in it, so a browser or a file manager can paste them" },
@@ -176,6 +179,7 @@ impl Config {
             "delete" => if self.delete == Delete::Direct { "direct" } else { "trash" }.into(),
             "clipboard_files" => b(self.clipboard_files),
             "watch" => b(self.watch),
+            "cd_on_quit" => b(self.cd_on_quit),
             "notifications" => LEVEL_NAMES[self.notify_min.min(5)].into(),
             "notification_cards" => self.notify_cards.to_string(),
             "notification_history" => self.notify_history.to_string(),
@@ -214,6 +218,7 @@ impl Config {
             "delete" => self.delete = if v == "direct" { Delete::Direct } else { Delete::Trash },
             "clipboard_files" => self.clipboard_files = on,
             "watch" => self.watch = on,
+            "cd_on_quit" => self.cd_on_quit = on,
             "notifications" => self.notify_min = LEVEL_NAMES.iter().position(|n| *n == v).unwrap_or(0),
             "notification_cards" => self.notify_cards = v.parse().unwrap_or(4),
             "notification_history" => self.notify_history = v.parse().unwrap_or(200),
@@ -255,6 +260,7 @@ impl Default for Config {
             notify_cards: 4,
             notify_history: 200,
             notify_secs: [2, 3, 3, 3, 6, 9],
+            cd_on_quit: false,
             fixed: Vec::new(),
             icons: lvim_fuzzy_ui::iconimg::Mode::Auto,
             zellij_images: true,
@@ -439,6 +445,10 @@ fn apply_key(c: &mut Config, k: &str, val: toml::Value, p: &std::path::Path, err
                 }
             }
             None => bad(errs, "a table: debug = 2, warn = 6, …"),
+        },
+        "cd_on_quit" => match val.as_bool() {
+            Some(b) => c.cd_on_quit = b,
+            None => bad(errs, "true or false"),
         },
         "clipboard_files" => match val.as_bool() {
             Some(b) => c.clipboard_files = b,

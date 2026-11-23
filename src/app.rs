@@ -655,6 +655,8 @@ struct Toast {
 /// What the program prints when it ends (`--print-dir`).
 pub struct Outcome {
     pub dir: Option<PathBuf>,
+    /// The setting `cd_on_quit`: the shell function changes to `dir` on a plain quit too.
+    pub cd_on_quit: bool,
     /// What the output menu chose to print (one per line), when it was used.
     pub print: Vec<String>,
 }
@@ -1254,6 +1256,7 @@ impl App {
         self.stop_procs();
         Ok(Outcome {
             dir: self.p().dir().map(Path::to_path_buf),
+            cd_on_quit: self.cfg.cd_on_quit,
             print: self.print_out.take().unwrap_or_default(),
         })
     }

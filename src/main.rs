@@ -45,8 +45,8 @@ Keys: F1 inside. Config: ~/.config/lvim-commander/config.toml ($LVIM_COMMANDER_C
 fn shell_snippet() -> &'static str {
     // lvc writes the folder it was left in (or Shift-Enter's folder of the choice) to a file the function names: its stdout stays the terminal's,
     // so an editor lvc starts draws on the screen, not into a pipe
-    "# lvcd: lvim-fuzzy-commander, then cd to where it was left (or to the folder Shift-Enter chose)\n\
-lvcd() {\n  local f d rc\n  f=\"$(mktemp)\" || return\n  LVC_OUT=\"$f\" command lvim-fuzzy-commander --print-dir \"$@\"\n  rc=$?\n  IFS= read -r d < \"$f\"\n  command rm -f \"$f\"\n  [ $rc -eq 0 ] && [ -d \"$d\" ] && cd -- \"$d\"\n}\n# `lvc` itself does the same, so there is one name to type\nlvc() { lvcd \"$@\"; }\n"
+    "# lvcd: lvim-fuzzy-commander, then cd to the folder Shift-Enter chose (and, with cd_on_quit, to where it was left)\n\
+lvcd() {\n  local f d rc\n  f=\"$(mktemp)\" || return\n  LVC_OUT=\"$f\" command lvim-fuzzy-commander \"$@\"\n  rc=$?\n  IFS= read -r d < \"$f\"\n  command rm -f \"$f\"\n  [ $rc -eq 0 ] && [ -d \"$d\" ] && cd -- \"$d\"\n}\n# `lvc` itself does the same, so there is one name to type\nlvc() { lvcd \"$@\"; }\n"
 }
 
 fn main() {
@@ -287,7 +287,7 @@ fn main() {
             // what cd chose to print; else, with --print-dir, the directory it was left in
             let text = if !o.print.is_empty() {
                 o.print.iter().map(|l| format!("{l}\n")).collect::<String>()
-            } else if print_dir && let Some(d) = o.dir {
+            } else if (print_dir || (o.cd_on_quit && std::env::var_os("LVC_OUT").is_some())) && let Some(d) = o.dir {
                 format!("{}\n", d.display())
             } else {
                 String::new()
