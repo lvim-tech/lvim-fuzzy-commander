@@ -43,9 +43,10 @@ Keys: F1 inside. Config: ~/.config/lvim-commander/config.toml ($LVIM_COMMANDER_C
 ";
 
 fn shell_snippet() -> &'static str {
-    // lvc prints the folder it was left in (or Shift-Enter's folder of the choice): the function changes to it
+    // lvc writes the folder it was left in (or Shift-Enter's folder of the choice) to a file the function names: its stdout stays the terminal's,
+    // so an editor lvc starts draws on the screen, not into a pipe
     "# lvcd: lvim-fuzzy-commander, then cd to where it was left (or to the folder Shift-Enter chose)\n\
-lvcd() {\n  local d\n  d=\"$(command lvim-fuzzy-commander --print-dir \"$@\")\" || return\n  d=\"${d%%$'\\n'*}\"\n  [ -d \"$d\" ] && cd -- \"$d\"\n}\n# `lvc` itself does the same, so there is one name to type\nlvc() { lvcd \"$@\"; }\n"
+lvcd() {\n  local f d rc\n  f=\"$(mktemp)\" || return\n  LVC_OUT=\"$f\" command lvim-fuzzy-commander --print-dir \"$@\"\n  rc=$?\n  IFS= read -r d < \"$f\"\n  command rm -f \"$f\"\n  [ $rc -eq 0 ] && [ -d \"$d\" ] && cd -- \"$d\"\n}\n# `lvc` itself does the same, so there is one name to type\nlvc() { lvcd \"$@\"; }\n"
 }
 
 fn main() {
@@ -284,12 +285,22 @@ fn main() {
     match out {
         Ok(o) => {
             // what cd chose to print; else, with --print-dir, the directory it was left in
-            if !o.print.is_empty() {
-                for l in &o.print {
-                    println!("{l}");
-                }
+            let text = if !o.print.is_empty() {
+                o.print.iter().map(|l| format!("{l}\n")).collect::<String>()
             } else if print_dir && let Some(d) = o.dir {
-                println!("{}", d.display());
+                format!("{}\n", d.display())
+            } else {
+                String::new()
+            };
+            // the shell function (`lvc --zsh`) asks for a file (`LVC_OUT`): its stdout must stay the terminal's, or the programs lvc starts (an editor)
+            // would draw into a pipe
+            match std::env::var_os("LVC_OUT") {
+                Some(f) => {
+                    if let Err(e) = std::fs::write(&f, &text) {
+                        eprintln!("lvim-fuzzy-commander: {}: {e}", std::path::Path::new(&f).display());
+                    }
+                }
+                None => print!("{text}"),
             }
         }
         Err(e) => {

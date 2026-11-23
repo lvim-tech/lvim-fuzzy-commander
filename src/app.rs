@@ -5813,13 +5813,14 @@ impl App {
             }
         }
         self.draw_footer(&mut cv, &l, h - 1, w);
-        self.draw_toasts(&mut cv, &l, w, h);
         if self.help {
             self.draw_help(&mut cv, &l, w, h);
         }
         if self.dialog.is_some() {
             self.draw_dialog(&mut cv, &l, w, h);
         }
+        // the notifications last: over everything, the popups too
+        self.draw_toasts(&mut cv, &l, w, h);
         cv
     }
 
@@ -6306,7 +6307,7 @@ impl App {
         let py = r.y + 1;
         let p = &self.panels[i];
         let searching = active && self.searching;
-        let badge_st = if searching { l.prompt } else { Style { bg: l.input.bg, ..l.count } };
+        let badge_st = l.prompt;
         let mut x = cv.put(r.x, py, " Search ", badge_st, r.x + r.w);
         // the gap between the badge and the field: a hairline
         x = hairline(cv, x, py, l.panel.bg, &l.input, r.x + r.w);
@@ -7155,7 +7156,7 @@ impl App {
                 let r = self.popup(cv, l, (w, h), (pw, n as u16 + 6), title);
                 let lim = r.x + r.w;
                 // the search field, as the panels have it
-                let badge = if *typing { l.prompt } else { Style { bg: l.input.bg, ..l.count } };
+                let badge = l.prompt;
                 let x = cv.put(r.x, r.y, " Search ", badge, lim);
                 let x = hairline(cv, x, r.y, l.popup.bg, &l.input, lim);
                 cv.fill(Rect { x, y: r.y, w: lim.saturating_sub(x), h: 1 }, l.input);
