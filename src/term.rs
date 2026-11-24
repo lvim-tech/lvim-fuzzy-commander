@@ -74,7 +74,6 @@ impl Term {
         lvim_fuzzy_ui::keyboard::push(&mut out);
         out.flush()?;
         // Zellij: our pane takes the Ctrl-h / j / k / l of lvim-winnav while lvc shows
-        crate::mux::mark(true);
         Ok(Term {
             out,
             w,
@@ -114,7 +113,6 @@ impl Term {
     pub fn suspend(&mut self) -> std::io::Result<()> {
         pause_input();
         // the program run marks the pane itself if it wants the nav keys (Neovim does)
-        crate::mux::mark(false);
         lvim_fuzzy_ui::keyboard::pop(&mut self.out);
         queue!(
             self.out,
@@ -131,7 +129,6 @@ impl Term {
     /// (the icons) stay. The program must draw in the screen it finds (`LVIM_FUZZY_KEEP_SCREEN`).
     pub fn suspend_in_place(&mut self) -> std::io::Result<()> {
         pause_input();
-        crate::mux::mark(false);
         self.out.flush()
     }
 
@@ -139,7 +136,6 @@ impl Term {
     pub fn resume_in_place(&mut self) -> std::io::Result<()> {
         terminal::enable_raw_mode()?;
         INPUT_ON.store(true, std::sync::atomic::Ordering::Release);
-        crate::mux::mark(true);
         queue!(self.out, cursor::Hide, EnableMouseCapture)?;
         lvim_fuzzy_ui::keyboard::push(&mut self.out);
         self.out.flush()?;
@@ -153,7 +149,6 @@ impl Term {
     pub fn resume(&mut self) -> std::io::Result<()> {
         terminal::enable_raw_mode()?;
         INPUT_ON.store(true, std::sync::atomic::Ordering::Release);
-        crate::mux::mark(true);
         queue!(
             self.out,
             terminal::EnterAlternateScreen,
@@ -175,7 +170,6 @@ impl Term {
 
 impl Drop for Term {
     fn drop(&mut self) {
-        crate::mux::mark(false);
         // the icon images go with the program
         let _ = self.out.write_all(&lvim_fuzzy_ui::iconimg::cleanup());
         lvim_fuzzy_ui::media::cleanup_files();

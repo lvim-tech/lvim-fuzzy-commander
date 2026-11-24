@@ -694,13 +694,15 @@ pub struct App {
     sync_browse: bool,
     /// `vz`: the active panel has the whole screen
     zoom: bool,
-    /// where the two panels meet, in percent of the width (drag the line with the mouse, or Ctrl-← / Ctrl-→)
+    /// where the two panels meet, in percent of the width (drag the line with the mouse, or Shift-← / Shift-→)
     split: u16,
     /// the column of the line, as it was drawn
     split_x: u16,
     term_cols: u16,
     /// the line is being dragged
     drag_split: bool,
+    /// the line moved with the keys and is not saved yet: it is saved once it has rested (a write per press would be a flood of files)
+    split_dirty: Option<Instant>,
     /// where the names start in the rows as they were drawn (the tooltip puts its text under them)
     name_x: std::cell::Cell<u16>,
     /// Ctrl-i: the whole name of the row under the cursor, as a tooltip over the list (any key hides it)
@@ -964,6 +966,7 @@ impl App {
             split_x: 0,
             term_cols: 80,
             drag_split: false,
+            split_dirty: None,
             viewer: false,
             fetch_jobs: Default::default(),
             fetching: Default::default(),
@@ -1242,6 +1245,10 @@ impl App {
                 break;
             }
             self.save_state_if_changed();
+            if self.split_dirty.is_some_and(|t| t.elapsed() > Duration::from_millis(1500)) {
+                self.split_dirty = None;
+                self.save_state();
+            }
             // sleep until a key or a wake-up (a preview made, an archive listed, Neovim painted, a change
             // on disk, an action done): both come on the wake channel, so nothing waits for a tick. The
             // timeouts are only for what has no wake-up of its own: the 30 ms before a picture goes out,
@@ -1725,7 +1732,6 @@ impl App {
                 self.tab_focus = Some(self.tab);
                 return Ok(());
             }
-            crate::mux::move_focus("up");
             return Ok(());
         }
         if self.help {
@@ -1872,12 +1878,8 @@ impl App {
             k.code == KeyCode::F(n) || (chord && k.code == KeyCode::Char(if n == 10 { '0' } else { (b'0' + n) as char }))
         };
         // Ctrl-h / Ctrl-l: the left / right panel (Tab: the other one)
-        // past the edge (Ctrl-h on the left panel, Ctrl-l on the right): the neighbouring Zellij pane
         if ctrl && !chord && matches!(k.code, KeyCode::Char('h') | KeyCode::Char('l')) {
             let want = if k.code == KeyCode::Char('h') { 0 } else { 1 };
-            if self.active == want && crate::mux::move_focus(if want == 0 { "left" } else { "right" }) {
-                return Ok(());
-            }
             self.active = want;
             self.pv_off = 0;
             return Ok(());
@@ -2023,9 +2025,15 @@ impl App {
             return Ok(());
         }
         match k.code {
-            // Ctrl-← / Ctrl-→: the line between the panels moves (the mouse drags it)
-            KeyCode::Left if ctrl && !self.viewer && !self.zoom => self.split = self.split.saturating_sub(3).max(15),
-            KeyCode::Right if ctrl && !self.viewer && !self.zoom => self.split = (self.split + 3).min(85),
+            // Shift-← / Shift-→: the line between the panels moves (the mouse drags it); the same keys as in lfz
+            KeyCode::Left if shift && !chord && !self.viewer && !self.zoom => {
+                self.split = self.split.saturating_sub(3).max(15);
+                self.split_dirty = Some(Instant::now());
+            }
+            KeyCode::Right if shift && !chord && !self.viewer && !self.zoom => {
+                self.split = (self.split + 3).min(85);
+                self.split_dirty = Some(Instant::now());
+            }
             KeyCode::Tab | KeyCode::BackTab => {
                 self.active = 1 - self.active;
                 self.pv_off = 0;
@@ -2320,7 +2328,7 @@ impl App {
 
     /// What decides whether the state is saved again: everything but the cursors (those are written with the rest).
     fn sig(st: &crate::config::State) -> String {
-        let mut s = format!("{}|{}|{:?}|{}", st.quick, st.tab, st.cols, st.split);
+        let mut s = format!("{}|{}|{:?}", st.quick, st.tab, st.cols);
         for t in &st.tabs {
             s += &format!(
                 "|{:?}/{}{}/{}{}/{}/{}",
@@ -5908,6 +5916,8 @@ impl App {
             }
             MouseEventKind::Up(MouseButton::Left) if self.drag_split => {
                 self.drag_split = false;
+                // saved once, when the button goes up — not on every move of the drag
+                self.save_state();
                 return Ok(());
             }
             _ => {}
@@ -6307,11 +6317,6 @@ impl App {
                 self.tab_focus = None;
                 self.go_tab(f);
             }
-            // out of lvc, up (Zellij)
-            KeyCode::Char('k') if ctrl => {
-                self.tab_focus = None;
-                crate::mux::move_focus("up");
-            }
             KeyCode::Esc | KeyCode::Char('j') | KeyCode::Down => self.tab_focus = None,
             _ => {}
         }
@@ -6343,10 +6348,6 @@ impl App {
                         self.footer_focus = Some(0);
                     }
                 }
-            }
-            // Ctrl-j on the bar: down, out of lvc (Zellij)
-            KeyCode::Char('j') if ctrl => {
-                crate::mux::move_focus("down");
             }
             // Esc: a group that was opened closes first (the focus stays on the bar), then the bar is left; k / ↑ leave at once
             KeyCode::Esc if self.group.is_some() => {

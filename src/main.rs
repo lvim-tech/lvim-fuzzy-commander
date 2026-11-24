@@ -9,7 +9,6 @@ mod fsx;
 mod ops;
 mod panel;
 mod instances;
-mod mux;
 mod plugins;
 mod subshell;
 mod term;

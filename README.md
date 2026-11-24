@@ -84,7 +84,7 @@ key: `leader` in the config is an error that says so.) Any command can be moved 
 | Ctrl-d · Ctrl-u | half a page down / up — of the quick view when it is open (a Neovim preview gets the keys), else of the list |
 | Delete | to the trash (`delete = "direct"`: for good) |
 | Ctrl-q | quit |
-| Ctrl-k | with several tabs, up onto the **tab bar** (a tab is lit): `h` / `l` (← →, Tab) choose, `Enter` goes to it, `Esc` / `j` / `Ctrl-j` back to the panels, `Ctrl-k` again out of lvc (Zellij) |
+| Ctrl-k | with several tabs, up onto the **tab bar** (a tab is lit): `h` / `l` (← →, Tab) choose, `Enter` goes to it, `Esc` / `j` / `Ctrl-j` back to the panels |
 | Ctrl-j | onto the bottom bar: its buttons as real buttons — h / l (← →, Tab) choose, Enter or Space presses, Ctrl-k (or Esc, k) back to the panel it came from; the mouse presses them too |
 
 The groups (`Esc` leaves one):
