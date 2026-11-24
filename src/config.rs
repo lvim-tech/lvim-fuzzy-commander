@@ -740,6 +740,8 @@ pub struct State {
     /// the tabs as they were left, in their order, and which one was current
     pub tabs: Vec<TabSave>,
     pub tab: usize,
+    /// where the two panels meet, in percent of the width
+    pub split: u16,
 }
 
 /// One panel of a saved tab: its directory and the entry the cursor was on.
@@ -1051,6 +1053,7 @@ fn state_from_text(text: &str) -> State {
     State {
         quick: t.get("quick").and_then(toml::Value::as_bool).unwrap_or(false),
         cols,
+        split: t.get("split").and_then(toml::Value::as_integer).unwrap_or(50).clamp(15, 85) as u16,
         tab: t.get("tab").and_then(toml::Value::as_integer).unwrap_or(0).max(0) as usize,
         tabs,
     }
@@ -1062,6 +1065,7 @@ fn state_to_text(st: &State) -> String {
     t.insert("columns".into(), toml::Value::Array(st.cols.list.iter().filter(|(_, on)| *on).map(|(k, _)| toml::Value::String(k.clone())).collect()));
     t.insert("column_order".into(), toml::Value::Array(st.cols.list.iter().map(|(k, _)| toml::Value::String(k.clone())).collect()));
     t.insert("tab".into(), (st.tab as i64).into());
+    t.insert("split".into(), (st.split as i64).into());
     let tabs: Vec<toml::Value> = st
         .tabs
         .iter()
@@ -1115,6 +1119,7 @@ mod state_tests {
         let st = State {
             quick: true,
             cols: Cols::default(),
+            split: 37,
             tab: 1,
             tabs: vec![tab(None, "/a", "/b", 0, false), tab(Some("build \u{1F527}"), "/c d", "/e", 1, true)],
         };

@@ -694,6 +694,17 @@ pub struct App {
     sync_browse: bool,
     /// `vz`: the active panel has the whole screen
     zoom: bool,
+    /// where the two panels meet, in percent of the width (drag the line with the mouse, or Ctrl-← / Ctrl-→)
+    split: u16,
+    /// the column of the line, as it was drawn
+    split_x: u16,
+    term_cols: u16,
+    /// the line is being dragged
+    drag_split: bool,
+    /// where the names start in the rows as they were drawn (the tooltip puts its text under them)
+    name_x: std::cell::Cell<u16>,
+    /// Ctrl-i: the whole name of the row under the cursor, as a tooltip over the list (any key hides it)
+    tip: bool,
     /// vf: the file under the cursor on the whole screen (a viewer in place), closed with Esc / q
     viewer: bool,
     /// the downloads to the cache on their way (by job), the files being downloaded, the ones that failed, what waits to be done
@@ -947,6 +958,12 @@ impl App {
             remote_tasks: Default::default(),
             sync_browse: false,
             zoom: false,
+            tip: false,
+            name_x: std::cell::Cell::new(0),
+            split: crate::config::load_state().split,
+            split_x: 0,
+            term_cols: 80,
+            drag_split: false,
             viewer: false,
             fetch_jobs: Default::default(),
             fetching: Default::default(),
@@ -1470,6 +1487,15 @@ impl App {
         if self.visual.is_some() && k.code == KeyCode::Esc && self.dialog.is_none() && self.group.is_none() {
             self.visual = None;
             return Ok(());
+        }
+        // Ctrl-i (a terminal with the keyboard protocol tells it from Tab): the whole name under the cursor; any other key hides it
+        if self.tip || (k.code == KeyCode::Char('i') && k.modifiers.contains(KeyModifiers::CONTROL)) {
+            let open = k.code == KeyCode::Char('i') && k.modifiers.contains(KeyModifiers::CONTROL) && self.dialog.is_none() && self.group.is_none();
+            let was = self.tip;
+            self.tip = open && !was;
+            if open || k.code == KeyCode::Esc {
+                return Ok(());
+            }
         }
         let before = (self.tab, self.active, self.panels[self.active].place.clone());
         let r = self.key_inner(k, term);
@@ -1997,6 +2023,9 @@ impl App {
             return Ok(());
         }
         match k.code {
+            // Ctrl-← / Ctrl-→: the line between the panels moves (the mouse drags it)
+            KeyCode::Left if ctrl && !self.viewer && !self.zoom => self.split = self.split.saturating_sub(3).max(15),
+            KeyCode::Right if ctrl && !self.viewer && !self.zoom => self.split = (self.split + 3).min(85),
             KeyCode::Tab | KeyCode::BackTab => {
                 self.active = 1 - self.active;
                 self.pv_off = 0;
@@ -2276,7 +2305,7 @@ impl App {
                 TabSave { name: self.tab_names[i].clone(), panels: [panel(&panels[0]), panel(&panels[1])], active, quick }
             })
             .collect();
-        crate::config::State { quick: self.quick, cols: self.cols.clone(), tabs, tab: self.tab }
+        crate::config::State { quick: self.quick, cols: self.cols.clone(), tabs, tab: self.tab, split: self.split }
     }
 
     fn save_state(&mut self) {
@@ -2291,7 +2320,7 @@ impl App {
 
     /// What decides whether the state is saved again: everything but the cursors (those are written with the rest).
     fn sig(st: &crate::config::State) -> String {
-        let mut s = format!("{}|{}|{:?}", st.quick, st.tab, st.cols);
+        let mut s = format!("{}|{}|{:?}|{}", st.quick, st.tab, st.cols, st.split);
         for t in &st.tabs {
             s += &format!(
                 "|{:?}/{}{}/{}{}/{}/{}",
@@ -5865,6 +5894,24 @@ impl App {
             self.footer_scroll(-1);
             return Ok(());
         }
+        // the line between the panels: dragged with the left button
+        let two = !self.viewer && !self.zoom;
+        let wide = self.term_cols.max(1);
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) if two && m.row > 0 && m.row < self.footer_y && m.column + 1 >= self.split_x && m.column <= self.split_x + 1 => {
+                self.drag_split = true;
+                return Ok(());
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.drag_split => {
+                self.split = ((m.column as u32 * 100 / wide as u32) as u16).clamp(15, 85);
+                return Ok(());
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.drag_split => {
+                self.drag_split = false;
+                return Ok(());
+            }
+            _ => {}
+        }
         let hit = |r: &Rect| m.column >= r.x && m.column < r.x + r.w && m.row >= r.y && m.row < r.y + r.h;
         let Some(i) = (0..2).find(|&i| hit(&self.list_rects[i])) else {
             return Ok(());
@@ -5895,6 +5942,7 @@ impl App {
 
     fn draw(&mut self, w: u16, h: u16) -> Canvas {
         self.term_rows = h as usize;
+        self.term_cols = w;
         let l = self.look.clone();
         let mut cv = Canvas::new(w, h);
         cv.base_bg = l.panel.bg;
@@ -5907,7 +5955,8 @@ impl App {
         // the lvim-fuzzy frame: a title bar, the content (inset by a blank ring), the button bar
         self.draw_title(&mut cv, &l, w);
         let area = Rect { x: 0, y: 1, w, h: h - 2 };
-        let mid = w / 2;
+        let mid = ((w as u32 * self.split.clamp(15, 85) as u32 / 100) as u16).clamp(12, w.saturating_sub(12));
+        self.split_x = mid;
         if self.viewer {
             // the file under the cursor on the whole screen (or the text git gave: a diff, a commit)
             let r = Rect { x: 1, y: area.y + 1, w: w.saturating_sub(2), h: area.h.saturating_sub(2) };
@@ -5947,9 +5996,67 @@ impl App {
         if self.dialog.is_some() {
             self.draw_dialog(&mut cv, &l, w, h);
         }
+        if self.tip && self.dialog.is_none() && !self.help {
+            self.draw_tip(&mut cv, &l, w, h);
+        }
         // the notifications last: over everything, the popups too
         self.draw_toasts(&mut cv, &l, w, h);
         cv
+    }
+
+    /// The tooltip of Ctrl-i: the whole name of the row under the cursor (and where a link points), above the row, over the list.
+    fn draw_tip(&self, cv: &mut Canvas, l: &Look, _w: u16, _h: u16) {
+        let p = &self.panels[self.active];
+        let Some(e) = p.current() else { return };
+        let list = self.list_rects[self.active];
+        if list.w < 12 || list.h < 2 || p.cursor < p.offset || p.cursor - p.offset >= list.h as usize {
+            return;
+        }
+        let mut text = e.name.clone();
+        if let Some(t) = &e.target {
+            text.push_str(" → ");
+            text.push_str(t);
+        }
+        // the ribbon runs the whole width of the list; the icon and its space come first (3 cells), a cell of room at the end
+        let inner = (list.w as usize).saturating_sub(self.name_x.get().max(3) as usize + 1).max(4);
+        let mut lines: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        for c in text.chars() {
+            if str_width(&cur) + str_width(&c.to_string()) > inner {
+                lines.push(std::mem::take(&mut cur));
+            }
+            cur.push(c);
+        }
+        if !cur.is_empty() {
+            lines.push(cur);
+        }
+        let row_y = list.y + (p.cursor - p.offset) as u16;
+        // above the row, or under it: where all the lines fit (above first); else the side with more room, cut to it
+        let above = row_y - list.y;
+        let below = (list.y + list.h).saturating_sub(row_y + 1);
+        let want = lines.len() as u16;
+        let up = if above >= want { true } else if below >= want { false } else { above >= below };
+        let room = if up { above } else { below }.max(1);
+        lines.truncate(room as usize);
+        let bh = lines.len() as u16;
+        let y = if up { row_y - bh } else { row_y + 1 };
+        let st = Style { attrs: crossterm::style::Attributes::default(), ..l.input };
+        let tx = list.x + self.name_x.get().max(3);
+        for (k, line) in lines.iter().enumerate() {
+            let yy = y + k as u16;
+            cv.fill(Rect { x: list.x, y: yy, w: list.w, h: 1 }, st);
+            // the icon where the rows' icons are, the text where their names start
+            if k == 0 {
+                let ix = list.x + 1;
+                if let Some(id) = lvim_fuzzy_ui::iconimg::image_id(&e.name, e.is_dir()) {
+                    cv.put_image_icon(ix, yy, id, st.bg, list.x + list.w);
+                } else {
+                    let (glyph, accent) = lvim_fuzzy_ui::lvim::icon(&e.name, e.is_dir());
+                    cv.put(ix, yy, glyph, Style { fg: l.theme.color(accent).or(st.fg), ..st }, list.x + list.w);
+                }
+            }
+            cv.put(tx, yy, line, st, list.x + list.w);
+        }
     }
 
     /// The title bar: what the active panel is (upper case, as lfz titles its finder), and on the right
@@ -6001,7 +6108,7 @@ impl App {
             None
         };
         // the badge and the hairline before it
-        let bw = badge.map_or(0, |b| str_width(b) as u16 + 1);
+        let bw = badge.map_or(0, |b| str_width(b) as u16);
         let rw = str_width(&right) as u16;
         let mut x = cv.put(0, 0, &truncate(&title, w.saturating_sub(rw + bw + 1) as usize), title_word(l, &bar), w);
         // the tabs, when there are several: number and the active panel's directory, the current one lit
@@ -6019,7 +6126,8 @@ impl App {
                     (None, Some(d)) => d.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "/".into()),
                     (None, None) => "trash".into(),
                 };
-                let text = format!(" {} {} ", i + 1, truncate(&name, 16));
+                // (no space before the number: the hairline is its left cell, the same space as right of the name)
+                let text = format!("{} {} ", i + 1, truncate(&name, 16));
                 // on a remote the tabs that are not this one are red too (the bar is)
                 let mut st = if i == self.tab { l.footer_label } else if self.p().remote().is_some() { red_chip(l) } else { l.footer_key };
                 // the chip the focus is on: lit like a chosen button of the bottom bar (the bar's hue turned over, full background), whatever
@@ -6041,7 +6149,7 @@ impl App {
             let st = Style { attrs: crossterm::style::Attributes::from(a), ..l.footer_label };
             let bx = w.saturating_sub(rw + bw);
             let bx = hairline(cv, bx, 0, bar.bg, &st, w);
-            cv.put(bx, 0, word, st, w.saturating_sub(rw));
+            cv.put(bx, 0, word.trim_start(), st, w.saturating_sub(rw));
         }
     }
 
@@ -6113,7 +6221,8 @@ impl App {
         let lit_key = Style { fg: l.footer_key.bg, bg: l.footer_key.fg, attrs: l.footer_key.attrs, ..l.footer_key };
         let lit_label = Style { fg: l.sel[0].fg, bg: l.sel[0].bg, attrs: l.sel[0].attrs, ..l.footer_label };
         let widths: Vec<usize> = keys.iter().map(|(k, lab, _)| str_width(k) + str_width(lab) + 4).collect();
-        let total: usize = widths.iter().sum::<usize>() + keys.len().saturating_sub(1);
+        // (the hairline between two buttons is the left cell of the next one's key: the same space left of the key as right of it)
+        let total: usize = widths.iter().sum::<usize>();
         self.footer_y = y;
         if (total as u16) < w {
             // it all fits: centred
@@ -6125,7 +6234,8 @@ impl App {
                     x = hairline(cv, x, y, l.panel.bg, if lit { &lit_key } else { &l.footer_key }, w);
                 }
                 let x0 = x;
-                x = cv.put(x, y, &format!(" {k} "), if lit { lit_key } else { l.footer_key }, w);
+                let ktxt = if i > 0 { format!("{k} ") } else { format!(" {k} ") };
+                x = cv.put(x, y, &ktxt, if lit { lit_key } else { l.footer_key }, w);
                 x = cv.put(x, y, &format!(" {lab} "), if lit { lit_label } else { l.footer_label }, w);
                 self.footer_btns.push((x0, x, *n));
             }
@@ -6134,7 +6244,7 @@ impl App {
         // longer than the screen: it scrolls (← → in a group, the wheel, a click on the arrows, Ctrl-j and h / l);
         // the arrows ‹ › show that more is there
         let room = w.saturating_sub(4) as usize;
-        let fits = |from: usize, to: usize| widths[from..=to].iter().sum::<usize>() + (to - from) <= room;
+        let fits = |from: usize, to: usize| widths[from..=to].iter().sum::<usize>() <= room;
         if let Some(f) = self.footer_focus {
             self.footer_off = self.footer_off.min(f);
             while !fits(self.footer_off, f) && self.footer_off < f {
@@ -6165,7 +6275,8 @@ impl App {
                 x = hairline(cv, x, y, l.panel.bg, if lit { &lit_key } else { &l.footer_key }, w);
             }
             let x0 = x;
-            x = cv.put(x, y, &format!(" {k} "), if lit { lit_key } else { l.footer_key }, w);
+            let ktxt = if i > self.footer_off { format!("{k} ") } else { format!(" {k} ") };
+            x = cv.put(x, y, &ktxt, if lit { lit_key } else { l.footer_key }, w);
             x = cv.put(x, y, &format!(" {lab} "), if lit { lit_label } else { l.footer_label }, w);
             self.footer_btns.push((x0, x, *n));
         }
@@ -6435,36 +6546,40 @@ impl App {
         let py = r.y + 1;
         let p = &self.panels[i];
         let searching = active && self.searching;
-        let badge_st = l.prompt;
-        let mut x = cv.put(r.x, py, " Search ", badge_st, r.x + r.w);
-        // the gap between the badge and the field: a hairline
-        x = hairline(cv, x, py, l.panel.bg, &l.input, r.x + r.w);
+        let badge_st = lvim_fuzzy_ui::lvim::search_badge_style(l);
+        let input_st = lvim_fuzzy_ui::lvim::search_field(l);
+        let x = cv.put_search_badge(r.x, py, badge_st, r.x + r.w);
+        // the field starts right at the badge; what is typed starts where the names of the rows below do (their marker cell,
+        // their icon, a space), so the two columns line up
         let field = Rect { x, y: py, w: (r.x + r.w).saturating_sub(x), h: 1 };
-        cv.fill(field, l.input);
+        cv.fill(field, input_st);
+        let name_off = match self.name_x.get() {
+            0 => 4,
+            n => n,
+        };
+        let tx = field.x.max(r.x + name_off);
         let qx = if p.query.is_empty() {
             let ghost = if searching {
-                "type to filter…"
+                ""
             } else if active {
                 "C-f or / to filter"
             } else {
                 ""
             };
             if searching {
-                field.x + 1
+                tx
             } else {
-                cv.put(field.x + 1, py, ghost, Style { bg: l.input.bg, ..l.count }, field.x + field.w);
+                cv.put(tx, py, ghost, Style { fg: l.prompt.fg, bg: input_st.bg, ..l.count }, field.x + field.w);
                 0
             }
         } else {
-            cv.put(field.x + 1, py, &p.query, l.input, field.x + field.w)
+            cv.put(tx, py, &p.query, input_st, field.x + field.w)
         };
         if searching && qx > 0 {
-            // the caret: a reversed cell after the query (the ghost text follows it when empty)
-            let caret = Style { attrs: crossterm::style::Attributes::from(crossterm::style::Attribute::Reverse), ..l.input };
-            cv.put(qx, py, " ", caret, field.x + field.w);
-            if p.query.is_empty() {
-                cv.put(qx + 1, py, "type to filter…", Style { bg: l.input.bg, ..l.count }, field.x + field.w);
-            }
+            // the caret: a thin bar (the left eighth of the cell) in the text's colour, not a block; where the query is empty the
+            // hint is not drawn (it would start under the bar)
+            let bar = Style { fg: input_st.fg, bg: input_st.bg, ..input_st };
+            cv.put(qx, py, "\u{258F}", bar, field.x + field.w);
         }
         // the rows, between the prompt and the info line
         let list = Rect { x: r.x, y: r.y + 2, w: r.w, h: r.h.saturating_sub(3) };
@@ -6651,6 +6766,7 @@ impl App {
                 x = cv.put(x, y, glyph, Style { fg: ifg, bg: base.bg, ..base }, name_lim);
             }
             x = cv.put(x, y, " ", base, name_lim);
+            self.name_x.set(x.saturating_sub(list.x));
             // the name in its file-listing role (dir / exec / link / broken), the matches marked
             let kind_st = if e.broken {
                 Some(broken_st)
@@ -6677,6 +6793,7 @@ impl App {
             if e.is_dir() && !e.is_parent() {
                 name.push('/');
             }
+            let name_x0 = x;
             for (ci, ch) in name.chars().enumerate() {
                 if x >= name_lim {
                     break;
@@ -6693,6 +6810,17 @@ impl App {
                 && let Some(t) = &e.target
             {
                 cv.put(x, y, &format!(" → {t}"), tint(l, "cyan", base, base.bg), name_lim);
+            }
+            // a name (and a link's target) that does not fit ends in an ellipsis: it is cut, Ctrl-i shows all of it
+            {
+                let full = str_width(&name)
+                    + match (&e.kind, &e.target) {
+                        (Kind::Link | Kind::LinkDir, Some(t)) => str_width(&format!(" → {t}")),
+                        _ => 0,
+                    };
+                if name_lim > name_x0 && name_x0 as usize + full > name_lim as usize {
+                    cv.put(name_lim - 1, y, "…", Style { fg: l.matched.fg, bg: base.bg, ..base }, name_lim);
+                }
             }
             let mut cx = lim - rw;
             for c in &cells {
@@ -7343,7 +7471,7 @@ impl App {
                 let lim = r.x + r.w;
                 // the search field, as the panels have it
                 let badge = l.prompt;
-                let x = cv.put(r.x, r.y, " Search ", badge, lim);
+                let x = cv.put_search_badge(r.x, r.y, badge, lim);
                 let x = hairline(cv, x, r.y, l.popup.bg, &l.input, lim);
                 cv.fill(Rect { x, y: r.y, w: lim.saturating_sub(x), h: 1 }, l.input);
                 if query.is_empty() {
