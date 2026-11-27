@@ -465,14 +465,18 @@ The themes are lvim-fuzzy's (`~/.config/lvim-fuzzy/themes`), so both programs we
 
 ## Build
 
-lvim-fuzzy-commander builds on two sibling crates: [lvim-fuzzy-core](https://github.com/lvim-tech/lvim-fuzzy-core)
-(the matcher) and [lvim-fuzzy-ui](https://github.com/lvim-tech/lvim-fuzzy-ui) (the look and the previews,
-shared with lvim-fuzzy), checked out next to it.
+The lvim-tech crates it builds on — [lvim-fuzzy-core](https://github.com/lvim-tech/lvim-fuzzy-core) (the matcher),
+[lvim-fuzzy-ui](https://github.com/lvim-tech/lvim-fuzzy-ui) (the look and the previews), [lvim-fuzzy-plugin](https://github.com/lvim-tech/lvim-fuzzy-plugin)
+(the plugin host) and [lvim-fuzzy-commander-core](https://github.com/lvim-tech/lvim-fuzzy-commander-core) (listing, operations, the trash; shared
+with the Neovim plugin) — are git dependencies, so **a lone clone builds by itself**; nothing has to be checked out next to it. Next to the other
+checkouts (a developer's folder) a `.cargo/config.toml` with `[patch]` entries makes cargo use them instead.
 
 ```sh
 cargo build --release
-scripts/install.sh      # ~/.local/bin/lvc
+scripts/install.sh      # ~/.local/bin/lvc, and the plugin host and the plugins lvc runs through (fetched and built when missing)
 ```
+
+Nothing of the Neovim side is needed: lvc works without the Neovim plugins, as the Neovim plugin works without lvc.
 
 ## The plugins and where each is used
 

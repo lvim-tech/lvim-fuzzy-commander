@@ -27,3 +27,6 @@ else
     echo "themes: no lvim-colorscheme checkout at $src (LVIM_COLORSCHEME=path); lvim-fuzzy's themes are used"
 fi
 echo "for lvcd (cd to where you left it): eval \"\$(lvim-fuzzy-commander --zsh)\" in ~/.zshrc"
+# the plugin host and the plugins lvc runs through (git, remote, devices, preview, open): fetched and built when missing
+boot=../lvim-fuzzy-plugin/scripts/bootstrap.sh
+if [ -f "$boot" ]; then sh "$boot" host git remote devices preview open; else curl -fsSL https://raw.githubusercontent.com/lvim-tech/lvim-fuzzy-plugin/main/scripts/bootstrap.sh | sh -s -- host git remote devices preview open; fi

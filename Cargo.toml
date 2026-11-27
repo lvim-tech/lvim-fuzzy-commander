@@ -13,16 +13,16 @@ path = "src/main.rs"
 
 [dependencies]
 # the search engine (fuzzy filtering of a panel)
-lvim-fuzzy-core = { path = "../lvim-fuzzy-core" }
+lvim-fuzzy-core = { git = "https://github.com/lvim-tech/lvim-fuzzy-core.git" }
 # listing, file operations and the trash: shared with the Neovim plugin
-lvim-fuzzy-commander-core = { path = "../lvim-fuzzy-commander-core" }
+lvim-fuzzy-commander-core = { git = "https://github.com/lvim-tech/lvim-fuzzy-commander-core.git" }
 # the lvim look: themes, canvas, icons, file and Neovim previews, the warm Neovim pool
-lvim-fuzzy-ui = { path = "../lvim-fuzzy-ui" }
+lvim-fuzzy-ui = { git = "https://github.com/lvim-tech/lvim-fuzzy-ui.git" }
 crossterm = { version = "0.29", features = ["use-dev-tty"] }
 toml = { version = "0.9", features = ["preserve_order"] }
 serde_json = "1"
 # the plugin host (process, native, WebAssembly and Lua runtimes), shared with lvim-fuzzy-cli and lvim-picker
-lvim-fuzzy-plugin = { path = "../lvim-fuzzy-plugin" }
+lvim-fuzzy-plugin = { git = "https://github.com/lvim-tech/lvim-fuzzy-plugin.git" }
 
 
 
