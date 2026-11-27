@@ -3007,7 +3007,7 @@ impl App {
         };
         let secs = |t: std::io::Result<std::time::SystemTime>| t.ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64);
         let when = |t: std::io::Result<std::time::SystemTime>| match secs(t) {
-            Some(t) => vec![(fsx::date_string(t), age_colour(t))],
+            Some(t) => vec![(fsx::date_string(t), lvim_fuzzy_ui::listview::age_colour(t))],
             None => vec![("—".to_string(), "comment")],
         };
         let ft = md.file_type();
@@ -6689,12 +6689,7 @@ impl App {
                 }
             } else {
                 let h = fsx::human_size(e.size);
-                let colour = match h.chars().last() {
-                    Some('K') => "green",
-                    Some('M') => "yellow",
-                    Some('G') | Some('T') => "red",
-                    _ => "comment",
-                };
+                let colour = lvim_fuzzy_ui::listview::size_colour(&h);
                 (h, colour)
             }
         };
@@ -6802,7 +6797,7 @@ impl App {
                             } else {
                                 (fsx::date_string(e.mtime), e.mtime)
                             };
-                            cells.push(Cell::text("date", txt, tint(l, age_colour(t), base, tb)));
+                            cells.push(Cell::text("date", txt, tint(l, lvim_fuzzy_ui::listview::age_colour(t), base, tb)));
                         }
                         // a column a plugin brings: what it answered for this folder (nothing yet: no cell)
                         other if other.contains('.') => {
@@ -8032,22 +8027,6 @@ pub fn prune_arcs() {
     }
 }
 
-/// How old a time is, as a colour: today green, this week teal, this month blue, this year purple, older
-/// dim.
-fn age_colour(t: i64) -> &'static str {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    match now - t {
-        d if d < 86_400 => "green",
-        d if d < 7 * 86_400 => "teal",
-        d if d < 31 * 86_400 => "blue",
-        d if d < 365 * 86_400 => "purple",
-        _ => "comment",
-    }
-}
-
 /// The path bar's three styles (the bar, the name's chip, the directory); on the active panel the whole bar takes the icon's background.
 fn bar_styles(l: &Look, active: bool) -> (Style, Style, Style) {
     use crossterm::style::{Attribute, Attributes};
@@ -8245,7 +8224,7 @@ fn put_facts(cv: &mut Canvas, l: &Look, x: u16, y: u16, e: &fsx::Entry, base: St
         x = cv.put(x, y, &fsx::human_size(e.size), tint(l, "cyan", base, bg), limit);
     }
     x = cv.put(x, y, "  ", base, limit);
-    x = cv.put(x, y, &fsx::date_string(e.mtime), tint(l, age_colour(e.mtime), base, bg), limit);
+    x = cv.put(x, y, &fsx::date_string(e.mtime), tint(l, lvim_fuzzy_ui::listview::age_colour(e.mtime), base, bg), limit);
     if let Some(t) = &e.target {
         x = cv.put(x, y, "  → ", tint(l, "comment", base, bg), limit);
         x = cv.put(x, y, t, tint(l, "cyan", base, bg), limit);
