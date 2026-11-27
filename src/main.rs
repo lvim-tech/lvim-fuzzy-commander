@@ -5,15 +5,14 @@ mod app;
 pub use lvim_fuzzy_ui::archive;
 mod complete;
 mod config;
-mod fsx;
-mod ops;
-mod panel;
 mod instances;
 mod plugins;
 mod subshell;
 mod term;
-mod trash;
 mod watch;
+
+// the commander's core (listing, file operations, trash), re-exported so the rest of the program keeps its paths
+pub use lvim_fuzzy_commander_core::{fsx, ops, panel, trash};
 
 use std::path::PathBuf;
 
@@ -28,6 +27,10 @@ OPTIONS
     --chooser-file FILE
                     a file chooser: Enter on a file (or on the marked ones) writes the paths to FILE, one a line,
                     and quits; quitting without choosing writes nothing (remove FILE first)
+    --keep-tabs     with --chooser-file: the tabs are restored from, and saved as, the way lvc was left (a host that
+                    keeps lvc as its file manager); without it a chooser run is a visit that leaves nothing
+    --session NAME  like --keep-tabs, but the tabs are kept apart under NAME (a host gives each project its own);
+                    the first run of a name starts in the current directory
     --zsh, --bash   print a shell function `lvcd` that changes to that directory
     --plugins       list the plugins, actions and previewers, and any problem with them
     --types [open|preview]
@@ -89,6 +92,7 @@ fn main() {
     }
     let mut print_dir = false;
     let mut chooser: Option<PathBuf> = None;
+    let mut keep_tabs = false;
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -106,6 +110,17 @@ fn main() {
                 return;
             }
             "--print-dir" => print_dir = true,
+            "--keep-tabs" => keep_tabs = true,
+            "--session" => match it.next() {
+                Some(n) => {
+                    config::set_session(&n);
+                    keep_tabs = true;
+                }
+                None => {
+                    eprintln!("lvc: --session needs a name");
+                    std::process::exit(2);
+                }
+            },
             "--chooser-file" => match it.next() {
                 Some(f) => chooser = Some(PathBuf::from(f)),
                 None => {
@@ -197,7 +212,7 @@ fn main() {
         let p = if p.is_absolute() { p } else { cwd.join(p) };
         std::fs::canonicalize(&p).unwrap_or(p)
     };
-    let explicit_dirs = !dirs.is_empty() || chooser.is_some();
+    let explicit_dirs = !dirs.is_empty() || (chooser.is_some() && !keep_tabs);
     let left = dirs.first().cloned().map(abs).unwrap_or_else(|| cwd.clone());
     let right = dirs.get(1).cloned().map(abs).unwrap_or_else(|| left.clone());
     for d in [&left, &right] {
@@ -277,7 +292,7 @@ fn main() {
         app.restore_tabs(&config::load_state());
     }
     if let Some(f) = chooser {
-        app.set_chooser(f);
+        app.set_chooser(f, keep_tabs);
     }
     let out = app.run(&mut term);
     drop(term);

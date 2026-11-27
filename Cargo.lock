@@ -759,11 +759,23 @@ version = "0.1.0"
 dependencies = [
  "crossterm",
  "libc",
+ "lvim-fuzzy-commander-core",
  "lvim-fuzzy-core",
  "lvim-fuzzy-plugin",
  "lvim-fuzzy-ui",
  "serde_json",
  "toml",
+]
+
+[[package]]
+name = "lvim-fuzzy-commander-core"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "lvim-fuzzy-core",
+ "lvim-fuzzy-plugin",
+ "lvim-fuzzy-ui",
+ "serde_json",
 ]
 
 [[package]]

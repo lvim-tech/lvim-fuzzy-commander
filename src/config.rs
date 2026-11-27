@@ -1022,8 +1022,24 @@ pub fn save_shell_history(h: &[String]) {
     let _ = std::fs::write(&p, h[from..].join("\n") + "\n");
 }
 
+/// The name of the session whose tabs this run keeps (`--session NAME`): its state lives apart in `sessions/NAME.toml`, so a host (an editor
+/// project) can have tabs of its own. Unset, the one shared `state.toml` is used.
+static SESSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub fn set_session(name: &str) {
+    let clean: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+    let _ = SESSION.set(clean);
+}
+
+fn tabs_state_path() -> PathBuf {
+    match SESSION.get() {
+        Some(n) if !n.is_empty() => state_path().with_file_name("sessions").join(format!("{n}.toml")),
+        _ => state_path(),
+    }
+}
+
 pub fn load_state() -> State {
-    state_from_text(&std::fs::read_to_string(state_path()).unwrap_or_default())
+    state_from_text(&std::fs::read_to_string(tabs_state_path()).unwrap_or_default())
 }
 
 fn state_from_text(text: &str) -> State {
@@ -1091,7 +1107,7 @@ fn state_to_text(st: &State) -> String {
 
 /// Written atomically (a temp file renamed over it); a failure is ignored — it is only a convenience.
 pub fn save_state(st: &State) {
-    let p = state_path();
+    let p = tabs_state_path();
     if let Some(d) = p.parent() {
         let _ = std::fs::create_dir_all(d);
     }

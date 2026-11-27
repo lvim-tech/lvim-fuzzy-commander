@@ -14,6 +14,8 @@ path = "src/main.rs"
 [dependencies]
 # the search engine (fuzzy filtering of a panel)
 lvim-fuzzy-core = { path = "../lvim-fuzzy-core" }
+# listing, file operations and the trash: shared with the Neovim plugin
+lvim-fuzzy-commander-core = { path = "../lvim-fuzzy-commander-core" }
 # the lvim look: themes, canvas, icons, file and Neovim previews, the warm Neovim pool
 lvim-fuzzy-ui = { path = "../lvim-fuzzy-ui" }
 crossterm = { version = "0.29", features = ["use-dev-tty"] }

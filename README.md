@@ -83,7 +83,7 @@ key: `leader` in the config is an error that says so.) Any command can be moved 
 | Ctrl-e · Ctrl-y | scroll the quick view one line |
 | Ctrl-d · Ctrl-u | half a page down / up — of the quick view when it is open (a Neovim preview gets the keys), else of the list |
 | Delete | to the trash (`delete = "direct"`: for good) |
-| Ctrl-q | quit |
+| Ctrl-c q | quit (also `aq`) |
 | Ctrl-k | with several tabs, up onto the **tab bar** (a tab is lit): `h` / `l` (← →, Tab) choose, `Enter` goes to it, `Esc` / `j` / `Ctrl-j` back to the panels |
 | Ctrl-j | onto the bottom bar: its buttons as real buttons — h / l (← →, Tab) choose, Enter or Space presses, Ctrl-k (or Esc, k) back to the panel it came from; the mouse presses them too |
 
@@ -206,7 +206,7 @@ in the remote directory, . What an engine cannot do it says:
 
 `lvc --chooser-file FILE [DIR…]`: Enter on a file — or on the marked ones — writes the paths to FILE, one on a line,
 and quits; a directory is entered as always. Quitting (`aq`) without choosing writes nothing, so remove FILE first and
-read it after. The tabs are not restored or saved in this mode (it is a visit, not the way lvc was left).
+read it after. The tabs are not restored or saved in this mode (it is a visit, not the way lvc was left) — `--keep-tabs` restores and saves them like a plain run; `--session NAME` does the same under a name of its own (`sessions/NAME.toml` beside `state.toml`), so a host can keep one set of tabs per project.
 E.g. an editor's file picker: `lvc --chooser-file /tmp/pick "$PWD" && cat /tmp/pick`.
 
 ## Icons

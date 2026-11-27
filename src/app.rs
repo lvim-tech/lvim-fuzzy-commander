@@ -664,6 +664,8 @@ pub struct Outcome {
 pub struct App {
     /// Ctrl-c was pressed: the next key is a command (every command outside the F-keys is Ctrl-c <key>).
     chord: bool,
+    /// Ctrl-c was pressed: the next `q` quits
+    ctrl_c: bool,
     /// the F-key actions: (action, its key now, the key it stands for in the code: its default F-key)
     fkeys: Vec<(&'static str, crate::plugins::KeySpec, KeyEvent)>,
     /// `[keys]` for every other command: (name, the key it is on now, its default key).
@@ -725,6 +727,8 @@ pub struct App {
     arc_enter: Option<ArcEnter>,
     /// `--chooser-file`: Enter on a file (or on the marks) writes the chosen paths here and quits
     chooser: Option<PathBuf>,
+    /// `--keep-tabs`: a chooser run restores and saves the tabs like any other
+    keep_tabs: bool,
     /// visual mode (`V`): the tab, the panel, the row it started on and the marks from before; the cursor's range is marked
     visual: Option<Visual>,
     cfg: Config,
@@ -785,6 +789,10 @@ pub struct App {
     /// The file last asked of Neovim (asked once, painted later).
     pv_path_sent: Option<String>,
     pv_off: usize,
+    /// The quick view of a folder is drawn as a panel is (its rows, columns and colours): the panel it is made into, kept by its key.
+    pv_panel: Option<(String, Panel)>,
+    /// Set while that panel is drawn: no prompt (the bar of the lines shown), no cursor, no info line.
+    pseudo_view: bool,
     wake_tx: Sender<()>,
     wake_rx: Receiver<()>,
     /// Where each panel's rows are drawn (for the mouse): (x, y, w, h).
@@ -904,6 +912,8 @@ impl App {
             watcher: if cfg.watch { crate::watch::Watcher::new() } else { None },
             pv_path_sent: None,
             pv_off: 0,
+            pv_panel: None,
+            pseudo_view: false,
             wake_tx,
             wake_rx,
             list_rects: [Rect { x: 0, y: 0, w: 0, h: 0 }; 2],
@@ -928,6 +938,7 @@ impl App {
             pv_out: Default::default(),
             searching: false,
             chord: false,
+            ctrl_c: false,
             fkeys: crate::config::FKEY_ACTIONS
                 .iter()
                 .map(|(a, def)| {
@@ -954,6 +965,7 @@ impl App {
             group: None,
             visual: None,
             chooser: None,
+            keep_tabs: false,
             arc_enter: None,
             subshell: None,
             remote: None,
@@ -1154,6 +1166,29 @@ impl App {
     fn columns_sync(&mut self) {
         if self.columns.is_empty() {
             return;
+        }
+        // the quick view's folder is asked too (the git marks and the rest of what the plugins' columns say)
+        if let Some((_, p)) = self.pv_panel.as_mut()
+            && let Some(key) = p.place_key()
+        {
+            if p.cells_dir.as_ref() != Some(&key) {
+                p.cells_dir = Some(key.clone());
+                p.cells_want = true;
+            }
+            if p.cells_want {
+                p.cells_want = false;
+                let names: Vec<String> = p.entries.iter().filter(|e| !e.is_parent()).map(|e| e.name.clone()).collect();
+                let dirs: Vec<String> = p.entries.iter().filter(|e| !e.is_parent() && e.is_dir()).map(|e| e.name.clone()).collect();
+                for c in self.columns.clone() {
+                    if !self.cols.get(&c.id) && !c.always {
+                        continue;
+                    }
+                    let ctx = serde_json::json!({"call": c.call, "column": c.id, "dir": key.1, "remote": key.0, "ssh": serde_json::Value::Null, "names": names, "dirs": dirs});
+                    if let Err(e) = self.host.call(&c.plugin, &c.call, ctx, std::slice::from_ref(&key.1)) {
+                        self.toast(e, true);
+                    }
+                }
+            }
         }
         for i in 0..2 {
             let Some(key) = self.panels[i].place_key() else { continue };
@@ -1572,7 +1607,6 @@ impl App {
         }
         match k.code {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('f') | KeyCode::Char('V') if !ctrl => self.close_viewer(),
-            KeyCode::Char('q') if ctrl => self.quit = true,
             // up onto the tab bar, down onto the button bar, as everywhere
             KeyCode::Char('k') if ctrl && self.tabs.len() > 1 => self.tab_focus = Some(self.tab),
             KeyCode::Char('j') if ctrl => self.footer_focus = Some(0),
@@ -1697,6 +1731,20 @@ impl App {
     }
 
     fn key_inner(&mut self, mut k: KeyEvent, term: &mut Term) -> std::io::Result<()> {
+        // Ctrl-c q quits (Ctrl-q is left to the host: in Neovim it sends the choice to the quickfix list). Any other
+        // key after Ctrl-c is just that key.
+        if self.dialog.is_none() {
+            let ctrl_only = k.modifiers.contains(KeyModifiers::CONTROL);
+            if std::mem::take(&mut self.ctrl_c) {
+                if k.code == KeyCode::Char('q') && !ctrl_only {
+                    self.quit = true;
+                    return Ok(());
+                }
+            } else if k.code == KeyCode::Char('c') && ctrl_only {
+                self.ctrl_c = true;
+                return Ok(());
+            }
+        }
         if self.viewer && self.dialog.is_none() && self.footer_focus.is_none() && self.tab_focus.is_none() {
             return self.viewer_key(k);
         }
@@ -1732,6 +1780,7 @@ impl App {
                 self.tab_focus = Some(self.tab);
                 return Ok(());
             }
+            leave("up");
             return Ok(());
         }
         if self.help {
@@ -1880,6 +1929,11 @@ impl App {
         // Ctrl-h / Ctrl-l: the left / right panel (Tab: the other one)
         if ctrl && !chord && matches!(k.code, KeyCode::Char('h') | KeyCode::Char('l')) {
             let want = if k.code == KeyCode::Char('h') { 0 } else { 1 };
+            if self.active == want && !self.viewer {
+                // already on that panel: out of lvc that way
+                leave(if want == 0 { "left" } else { "right" });
+                return Ok(());
+            }
             self.active = want;
             self.pv_off = 0;
             return Ok(());
@@ -2251,7 +2305,7 @@ impl App {
             KeyCode::Char('N') if chord => self.bookmark_rename_list(),
             KeyCode::Char('e') if chord => self.extract(),
             KeyCode::Char('z') if chord => self.compress(),
-            KeyCode::Char('q') if chord || ctrl => self.quit = true,
+            KeyCode::Char('q') if chord => self.quit = true,
             KeyCode::F(10) => self.quit = true,
             KeyCode::F(1) => {
                 self.help = true;
@@ -2317,8 +2371,8 @@ impl App {
     }
 
     fn save_state(&mut self) {
-        // a chooser run is a visit, not the way lvc was left
-        if self.chooser.is_some() {
+        // a chooser run is a visit, not the way lvc was left (unless the host asked to keep the tabs)
+        if self.chooser.is_some() && !self.keep_tabs {
             return;
         }
         let st = self.state();
@@ -4882,6 +4936,10 @@ impl App {
     fn each_panel(&mut self, mut f: impl FnMut(&mut Panel)) {
         self.panels.iter_mut().for_each(&mut f);
         self.tabs.iter_mut().flatten().for_each(|t| t.panels.iter_mut().for_each(&mut f));
+        // (the quick view of a folder is a panel too: the plugins' columns and marks reach it)
+        if let Some((_, p)) = self.pv_panel.as_mut() {
+            f(p);
+        }
     }
 
     /// Apply a plugin's answer; a bad one is shown as an error.
@@ -5528,8 +5586,9 @@ impl App {
         true
     }
 
-    pub fn set_chooser(&mut self, file: PathBuf) {
+    pub fn set_chooser(&mut self, file: PathBuf, keep_tabs: bool) {
         self.chooser = Some(file);
+        self.keep_tabs = keep_tabs;
     }
 
     fn open_current(&mut self, term: &mut Term) -> std::io::Result<()> {
@@ -6318,6 +6377,10 @@ impl App {
                 self.go_tab(f);
             }
             KeyCode::Esc | KeyCode::Char('j') | KeyCode::Down => self.tab_focus = None,
+            KeyCode::Char('k') if ctrl => {
+                self.tab_focus = None;
+                leave("up");
+            }
             _ => {}
         }
         Ok(())
@@ -6362,7 +6425,8 @@ impl App {
                 self.group = None;
                 self.footer_focus = None;
             }
-            KeyCode::Char('q') if ctrl => self.quit = true,
+            // Ctrl-j again, on the bar already: out of lvc, down
+            KeyCode::Char('j') if ctrl => leave("down"),
             // an F-key itself still works
             KeyCode::F(_) => {
                 self.footer_focus = None;
@@ -6585,10 +6649,22 @@ impl App {
         // the rows, between the prompt and the info line
         let list = Rect { x: r.x, y: r.y + 2, w: r.w, h: r.h.saturating_sub(3) };
         self.list_rects[i] = list;
+        let pseudo = self.pseudo_view;
         let p = &mut self.panels[i];
-        p.scroll(list.h as usize);
+        if pseudo {
+            // the quick view of a folder: it scrolls by its own offset, its prompt row tells which rows show
+            p.offset = p.offset.min(p.shown.len().saturating_sub(list.h as usize));
+            let (off, total) = (p.offset, p.shown.len());
+            self.draw_scroll_bar(cv, l, Rect { x: r.x, y: py, w: r.w, h: 1 }, off, total, list.h as usize);
+        }
+        let p = &mut self.panels[i];
+        if !pseudo {
+            p.scroll(list.h as usize);
+        }
         if let Some(e) = &p.error {
             cv.put(list.x + 1, list.y, &truncate(e, list.w as usize - 1), l.marker, list.x + list.w);
+        } else if pseudo {
+            // (the bar says `No data` for an empty folder)
         } else if p.shown.is_empty() {
             let msg = if p.query.is_empty() { "[empty]" } else { "[no matches]" };
             cv.put(list.x + 1, list.y, msg, l.count, list.x + list.w);
@@ -6687,7 +6763,7 @@ impl App {
                             } else if e.is_exec() {
                                 ("EXE", "green")
                             } else {
-                                ("FILE", "comment")
+                                ("FILE", "yellow")
                             };
                             // a folder that is bookmarked has a star where the cell's padding is
                             let kept = e.is_dir() && {
@@ -6872,6 +6948,11 @@ impl App {
         if r.h < 3 || r.w < 8 {
             return;
         }
+        // a folder is shown as a panel is: the same rows, columns and colours, no cursor
+        if path.is_dir() && self.p().remote().is_none() && !self.p().is_trash() && self.p().archive.is_none() {
+            self.draw_dir_view(cv, l, r, &path);
+            return;
+        }
         self.draw_path_bar(cv, l, r, &path, None, None, 0, false);
         let inner = Rect { x: r.x, y: r.y + 1, w: r.w, h: r.h - 1 };
         let ps = path.to_string_lossy().into_owned();
@@ -6958,6 +7039,59 @@ impl App {
         self.draw_file_preview(cv, l, inner, &ps);
     }
 
+    /// The quick view of a folder: a panel made of it (without `..`, the order and the hidden flag of the panel you are in) drawn by `draw_panel`
+    /// in the other panel's place, its prompt row being the bar of the lines shown.
+    fn draw_dir_view(&mut self, cv: &mut Canvas, l: &Look, r: Rect, path: &Path) {
+        let (hidden, sort, reverse) = {
+            let a = self.p();
+            (a.hidden, a.sort, a.reverse)
+        };
+        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        let key = format!("{}|{hidden}|{}|{reverse}|{mtime:?}", path.display(), sort.label());
+        if self.pv_panel.as_ref().map(|(k, _)| k.as_str()) != Some(key.as_str()) {
+            let mut p = Panel::new(path.to_path_buf(), hidden);
+            p.sort = sort;
+            p.reverse = reverse;
+            p.reload();
+            p.entries.retain(|e| !e.is_parent());
+            p.refilter();
+            p.cursor = usize::MAX;
+            self.pv_panel = Some((key, p));
+            self.pv_off = 0;
+        }
+        let other = 1 - self.active;
+        let Some((_, mut pseudo)) = self.pv_panel.take() else { return };
+        pseudo.offset = self.pv_off;
+        std::mem::swap(&mut self.panels[other], &mut pseudo);
+        self.pseudo_view = true;
+        self.draw_panel(cv, l, other, r);
+        self.pseudo_view = false;
+        std::mem::swap(&mut self.panels[other], &mut pseudo);
+        self.pv_off = pseudo.offset;
+        let key = format!("{}|{hidden}|{}|{reverse}|{mtime:?}", path.display(), sort.label());
+        self.pv_panel = Some((key, pseudo));
+    }
+
+    /// The bar over a quick view's text: which lines are shown (from – to / all) under the icons' column, and at the right end how to
+    /// scroll (only when there is something to scroll); an empty file or folder says `No data`. The body is the rows under the bar.
+    fn draw_scroll_bar(&self, cv: &mut Canvas, l: &Look, inner: Rect, off: usize, total: usize, visible: usize) {
+        let field = lvim_fuzzy_ui::lvim::search_field(l);
+        cv.fill(Rect { x: inner.x, y: inner.y, w: inner.w, h: 1 }, field);
+        let left = if total == 0 { " 0 / 0".to_string() } else { format!(" {}–{} / {}", off + 1, (off + visible).min(total), total) };
+        let lim = inner.x + inner.w;
+        cv.put(inner.x, inner.y, &left, field, lim);
+        if total > visible {
+            let hint = "C-d C-u to scroll ";
+            let hw = str_width(hint) as u16;
+            if inner.w > hw + str_width(&left) as u16 + 1 {
+                cv.put(lim - hw, inner.y, hint, field, lim);
+            }
+        }
+        if total == 0 && inner.h > 1 {
+            cv.put(inner.x, inner.y + 1, " No data", l.count, lim);
+        }
+    }
+
     fn draw_file_preview(&mut self, cv: &mut Canvas, l: &Look, inner: Rect, path: &str) {
         let Some(view) = self.loader.view(path) else {
             return;
@@ -6967,8 +7101,11 @@ impl App {
             return;
         }
         let total = view.lines.len();
-        let h = inner.h as usize;
+        // the bar takes the first row; the text is under it, starting where the icons of the panels' rows do
+        let h = (inner.h as usize).saturating_sub(1);
         self.pv_off = self.pv_off.min(total.saturating_sub(h));
+        self.draw_scroll_bar(cv, l, inner, self.pv_off, total, h);
+        let inner = Rect { x: inner.x + 1, y: inner.y + 1, w: inner.w.saturating_sub(1), h: inner.h.saturating_sub(1) };
         let nr_w = if view.is_dir { 0 } else { total.max(1).to_string().len() as u16 + 1 };
         for (i, line) in view.lines.iter().skip(self.pv_off).take(h).enumerate() {
             let y = inner.y + i as u16;
@@ -7039,8 +7176,10 @@ impl App {
             });
             return;
         };
-        let h = inner.h as usize;
+        let h = (inner.h as usize).saturating_sub(1);
         self.pv_off = self.pv_off.min(lines.len().saturating_sub(h));
+        self.draw_scroll_bar(cv, l, inner, self.pv_off, lines.len(), h);
+        let inner = Rect { x: inner.x + 1, y: inner.y + 1, w: inner.w.saturating_sub(1), h: inner.h.saturating_sub(1) };
         let mut carry = Style::default();
         for (i, line) in lines.iter().enumerate() {
             let (text, runs, end) = lvim_fuzzy_ui::ansi::parse(line, carry);
@@ -7471,7 +7610,7 @@ impl App {
                 let r = self.popup(cv, l, (w, h), (pw, n as u16 + 6), title);
                 let lim = r.x + r.w;
                 // the search field, as the panels have it
-                let badge = l.prompt;
+                let badge = Style { bg: l.input.bg, ..l.prompt };
                 let x = cv.put_search_badge(r.x, r.y, badge, lim);
                 let x = hairline(cv, x, r.y, l.popup.bg, &l.input, lim);
                 cv.fill(Rect { x, y: r.y, w: lim.saturating_sub(x), h: 1 }, l.input);
@@ -7663,7 +7802,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
         ("Esc", "clear the query, then the marks"),
         ("o …", "operations: c copy · m move (to the other panel; the target can be edited and end in a rename mask: *.md = the name without its last extension + .md, old_** = old_ + the whole name) · r refresh · R rename the tab · N rename (several marked: all in the editor) · n new (a directory when the name ends in /) · e edit · d trash · D delete for good · o the menu · t the running operations (they run side by side; x cancels one)"),
         ("Delete", "to the trash (config: delete = \"direct\")"),
-        ("Ctrl-q", "quit"),
+        ("Ctrl-c q", "quit"),
         ("Ctrl-j", "onto the F-key buttons: h / l choose, Enter presses, Ctrl-k / Esc back"),
         ("t …", "tabs: N new · n / p next / previous · d close · e rename · < > move · i other lvc · 1-9 go to"),
         ("m …", "marks: a all · * invert · + / - mark / unmark by glob"),
@@ -8153,5 +8292,32 @@ mod tests {
         assert_eq!(uri_decode("/a%20b"), "/a b");
         // a lone % is left as it is
         assert_eq!(uri_decode("/50%"), "/50%");
+    }
+}
+
+/// Out of lvc toward `dir` ("left" / "right" / "up" / "down"): at an edge of lvc, the key that has nowhere to go inside it goes
+/// to what hosts it. In a Neovim terminal (`$NVIM` names its socket) Neovim leaves terminal mode and moves to the window
+/// that way (lvim-winnav when it is there); in Zellij (`$ZELLIJ`) the focus moves to the pane that way. Elsewhere: nothing.
+fn leave(dir: &str) {
+    let quiet = |c: &mut std::process::Command| {
+        let _ = c
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    };
+    if let Some(sock) = std::env::var_os("NVIM").filter(|v| !v.is_empty()) {
+        let wincmd = match dir {
+            "left" => "h",
+            "right" => "l",
+            "up" => "k",
+            _ => "j",
+        };
+        let keys = format!(
+            "<C-\\><C-n>:lua local ok, w = pcall(require, 'lvim-winnav'); if ok then w.move('{dir}') else vim.cmd('wincmd {wincmd}') end<CR>"
+        );
+        quiet(std::process::Command::new("nvim").arg("--server").arg(sock).arg("--remote-send").arg(keys));
+    } else if std::env::var_os("ZELLIJ").is_some_and(|v| !v.is_empty()) {
+        quiet(std::process::Command::new("zellij").args(["action", "move-focus", dir]));
     }
 }
