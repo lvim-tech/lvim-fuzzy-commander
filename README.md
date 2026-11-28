@@ -23,7 +23,8 @@ Status: early development.
   directory goes to the trash).
 - The quick view (`vv`) shows the file under the cursor in place of the other panel: a real Neovim (taken
   warm from `lvim-fuzzy-cli pool` when it runs), with the built-in preview while Neovim catches up, for
-  directories, and as a fallback; an archive shows its listing.
+  directories, and as a fallback; an archive shows its listing. A folder in a remote place, an archive or the trash is shown as a panel is
+  (a remote one is listed by the remote plugin, asked once while the cursor stays on it).
 - Tabs: `tN` opens one (on the same two directories), `td` closes it, `tn` `tp` `t1`…`t9`
   go between them; `te` gives the tab a name of its own (empty: its directory's name again), `t<` / `t>` (past the end it wraps round)
   move it left / right. The title bar lists them: a click goes to a tab, a middle click closes it, a right click

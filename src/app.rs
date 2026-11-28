@@ -2745,23 +2745,41 @@ impl App {
         for (tag, result) in r.poll() {
             match self.remote_tasks.remove(&tag) {
                 Some(RemoteTask::List) => {
-                    let Some(i) = (0..2).find(|&i| self.panels[i].remote_tag == Some(tag)) else { continue };
-                    self.panels[i].remote_tag = None;
+                    // a panel's directory, or the folder the quick view shows
+                    let idx = (0..2).find(|&i| self.panels[i].remote_tag == Some(tag));
+                    let quick = idx.is_none() && self.pv_panel.as_ref().is_some_and(|(_, p)| p.remote_tag == Some(tag));
+                    if idx.is_none() && !quick {
+                        continue;
+                    }
+                    let p: &mut Panel = match idx {
+                        Some(i) => &mut self.panels[i],
+                        None => &mut self.pv_panel.as_mut().expect("checked").1,
+                    };
+                    p.remote_tag = None;
+                    let mut failed = None;
                     match result {
                         Ok(v) => {
                             // the engine may say which directory it really listed (`~` is the home on sftp): that is the path now
                             if let Some(real) = v["path"].as_str()
-                                && let Place::Remote { remote, .. } = self.panels[i].place.clone()
+                                && let Place::Remote { remote, .. } = p.place.clone()
                             {
-                                self.panels[i].place = Place::Remote { remote, path: real.to_string() };
+                                p.place = Place::Remote { remote, path: real.to_string() };
                             }
-                            self.panels[i].set_remote_entries(lvim_fuzzy_plugin::remote::entries(&v));
+                            p.set_remote_entries(lvim_fuzzy_plugin::remote::entries(&v));
+                            if quick {
+                                p.entries.retain(|e| !e.is_parent());
+                                p.refilter();
+                                p.cursor = usize::MAX;
+                            }
                         }
                         Err(e) => {
                             // (a login that is refused is the plugin's to ask a password for: what reaches here is the end of it)
-                            self.panels[i].set_remote_error(e.clone());
-                            self.toast(format!("remote: {e}"), true);
+                            p.set_remote_error(e.clone());
+                            failed = Some(e);
                         }
+                    }
+                    if let (Some(e), false) = (failed, quick) {
+                        self.toast(format!("remote: {e}"), true);
                     }
                 }
                 Some(RemoteTask::Users { remote, paths, owner }) => match result {
@@ -6936,6 +6954,13 @@ impl App {
 
     /// The quick view: as lfz's preview — the file bar, then the body.
     fn draw_preview(&mut self, cv: &mut Canvas, l: &Look, r: Rect) {
+        if r.h >= 3
+            && r.w >= 8
+            && let Some((remote, rpath)) = self.remote_dir_under_cursor()
+        {
+            self.draw_remote_dir_view(cv, l, r, remote, rpath);
+            return;
+        }
         let path = self.pcur();
         let Some(path) = path.filter(|p| !p.as_os_str().is_empty()) else {
             // a remote file that could not be had: why, in the pane
@@ -6954,7 +6979,7 @@ impl App {
             return;
         }
         // a folder is shown as a panel is: the same rows, columns and colours, no cursor
-        if path.is_dir() && self.p().remote().is_none() && !self.p().is_trash() && self.p().archive.is_none() {
+        if path.is_dir() && self.p().remote().is_none() {
             self.draw_dir_view(cv, l, r, &path);
             return;
         }
@@ -7086,8 +7111,13 @@ impl App {
             self.pv_panel = Some((key, p));
             self.pv_off = 0;
         }
+        self.draw_pseudo_panel(cv, l, r);
+    }
+
+    /// Draw the panel of the quick view of a folder (`pv_panel`) in the other panel's place: its prompt row is the bar of the lines shown.
+    fn draw_pseudo_panel(&mut self, cv: &mut Canvas, l: &Look, r: Rect) {
         let other = 1 - self.active;
-        let Some((_, mut pseudo)) = self.pv_panel.take() else { return };
+        let Some((key, mut pseudo)) = self.pv_panel.take() else { return };
         pseudo.offset = self.pv_off;
         std::mem::swap(&mut self.panels[other], &mut pseudo);
         self.pseudo_view = true;
@@ -7095,8 +7125,45 @@ impl App {
         self.pseudo_view = false;
         std::mem::swap(&mut self.panels[other], &mut pseudo);
         self.pv_off = pseudo.offset;
-        let key = format!("{}|{hidden}|{}|{reverse}|{mtime:?}", path.display(), sort.label());
         self.pv_panel = Some((key, pseudo));
+    }
+
+    /// The remote folder under the cursor of a remote panel: (the remote, its path in it).
+    fn remote_dir_under_cursor(&self) -> Option<(String, String)> {
+        let p = self.p();
+        let (remote, _) = p.remote()?;
+        let e = p.current().filter(|e| !e.is_parent() && e.is_dir())?;
+        Some((remote.to_string(), p.remote_path_of(e)?))
+    }
+
+    /// The quick view of a remote folder: it is listed by the plugin (asked once, kept while the cursor stays), then drawn as a panel is.
+    fn draw_remote_dir_view(&mut self, cv: &mut Canvas, l: &Look, r: Rect, remote: String, rpath: String) {
+        let (hidden, sort, reverse) = {
+            let a = self.p();
+            (a.hidden, a.sort, a.reverse)
+        };
+        let key = format!("remote:{remote}:{rpath}|{hidden}|{}|{reverse}", sort.label());
+        if self.pv_panel.as_ref().map(|(k, _)| k.as_str()) != Some(key.as_str()) {
+            let mut p = Panel::new(PathBuf::from("/"), hidden);
+            p.sort = sort;
+            p.reverse = reverse;
+            p.place = Place::Remote { remote: remote.clone(), path: rpath.clone() };
+            match self.remote_client().call("list", serde_json::json!({"remote": remote, "path": rpath})) {
+                Ok(tag) => {
+                    p.remote_tag = Some(tag);
+                    self.remote_tasks.insert(tag, RemoteTask::List);
+                }
+                Err(e) => p.set_remote_error(e),
+            }
+            p.cursor = usize::MAX;
+            self.pv_panel = Some((key, p));
+            self.pv_off = 0;
+        }
+        if self.pv_panel.as_ref().is_some_and(|(_, p)| p.remote_tag.is_some()) {
+            cv.put(r.x + 1, r.y, "…", l.counter, r.x + r.w);
+            return;
+        }
+        self.draw_pseudo_panel(cv, l, r);
     }
 
     fn draw_file_preview(&mut self, cv: &mut Canvas, l: &Look, inner: Rect, path: &str) {
