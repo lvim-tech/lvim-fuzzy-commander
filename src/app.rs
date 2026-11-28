@@ -6655,7 +6655,7 @@ impl App {
             // the quick view of a folder: it scrolls by its own offset, its prompt row tells which rows show
             p.offset = p.offset.min(p.shown.len().saturating_sub(list.h as usize));
             let (off, total) = (p.offset, p.shown.len());
-            Self::draw_scroll_bar(cv, l, Rect { x: r.x, y: py, w: r.w, h: 1 }, off, total, list.h as usize);
+            lvim_fuzzy_ui::listview::scroll_bar(cv, l, Rect { x: r.x, y: py, w: r.w, h: 1 }, off, total, list.h as usize);
         }
         let p = &mut self.panels[i];
         if !pseudo {
@@ -6907,6 +6907,16 @@ impl App {
                 cv.put(cx, y, " ", base, lim);
             }
         }
+        // the scrollbar, in the blank column right of the rows (the ring), whenever there is more than shows (as lfz's)
+        lvim_fuzzy_ui::listview::thumb(
+            cv,
+            list.x + list.w,
+            list.y,
+            list.h as usize,
+            p.offset,
+            p.shown.len(),
+            Style { bg: l.panel.bg, ..l.scrollbar },
+        );
         // the line about the entry under the cursor (dim, as lfz's counters)
         let iy = r.y + r.h - 1;
         let info = match p.current() {
@@ -7016,7 +7026,23 @@ impl App {
                         let (top, bot, total) = g.view;
                         if total > 0 {
                             let shown = (bot + 1).saturating_sub(top.max(1));
-                            Self::draw_scroll_bar(cv, l, inner, top.max(1) - 1, total, shown.max(1));
+                            lvim_fuzzy_ui::listview::scroll_bar(cv, l, Rect { h: 1, ..inner }, top.max(1) - 1, total, shown.max(1));
+                            lvim_fuzzy_ui::listview::thumb_view(
+                                cv,
+                                inner.x + inner.w,
+                                inner.y + 1,
+                                inner.h.saturating_sub(1) as usize,
+                                top.max(1) - 1,
+                                shown.max(1),
+                                total,
+                                Style { bg: l.panel.bg, ..l.preview_scrollbar },
+                            );
+                        }
+                        // the indent is padding, not margin: the cell left of the text is the preview's own colour, as the text rows are
+                        if g.default_bg.is_some() {
+                            for row in 0..inner.h.saturating_sub(1) {
+                                cv.fill(Rect { x: inner.x, y: inner.y + 1 + row, w: 1, h: 1 }, Style { bg: g.default_bg, ..Style::default() });
+                            }
                         }
                         let (gw, gh) = (g.w.min(inner.w.saturating_sub(1) as usize), g.h.min(inner.h.saturating_sub(1) as usize));
                         for row in 0..gh {
@@ -7073,26 +7099,6 @@ impl App {
         self.pv_panel = Some((key, pseudo));
     }
 
-    /// The bar over a quick view's text: which lines are shown (from – to / all) under the icons' column, and at the right end how to
-    /// scroll (only when there is something to scroll); an empty file or folder says `No data`. The body is the rows under the bar.
-    fn draw_scroll_bar(cv: &mut Canvas, l: &Look, inner: Rect, off: usize, total: usize, visible: usize) {
-        let field = lvim_fuzzy_ui::lvim::search_field(l);
-        cv.fill(Rect { x: inner.x, y: inner.y, w: inner.w, h: 1 }, field);
-        let left = if total == 0 { " 0 / 0".to_string() } else { format!(" {}–{} / {}", off + 1, (off + visible).min(total), total) };
-        let lim = inner.x + inner.w;
-        cv.put(inner.x, inner.y, &left, field, lim);
-        if total > visible {
-            let hint = "C-d C-u to scroll ";
-            let hw = str_width(hint) as u16;
-            if inner.w > hw + str_width(&left) as u16 + 1 {
-                cv.put(lim - hw, inner.y, hint, field, lim);
-            }
-        }
-        if total == 0 && inner.h > 1 {
-            cv.put(inner.x, inner.y + 1, " No data", l.count, lim);
-        }
-    }
-
     fn draw_file_preview(&mut self, cv: &mut Canvas, l: &Look, inner: Rect, path: &str) {
         let Some(view) = self.loader.view(path) else {
             return;
@@ -7105,7 +7111,9 @@ impl App {
         // the bar takes the first row; the text is under it, starting where the icons of the panels' rows do
         let h = (inner.h as usize).saturating_sub(1);
         self.pv_off = self.pv_off.min(total.saturating_sub(h));
-        Self::draw_scroll_bar(cv, l, inner, self.pv_off, total, h);
+        lvim_fuzzy_ui::listview::scroll_bar(cv, l, Rect { h: 1, ..inner }, self.pv_off, total, h);
+        // the scrollbar stands in the blank column right of the text (the ring), as lfz's
+        lvim_fuzzy_ui::listview::thumb(cv, inner.x + inner.w, inner.y + 1, h, self.pv_off, total, Style { bg: l.panel.bg, ..l.preview_scrollbar });
         let inner = Rect { x: inner.x + 1, y: inner.y + 1, w: inner.w.saturating_sub(1), h: inner.h.saturating_sub(1) };
         for (i, line) in view.lines.iter().skip(self.pv_off).take(h).enumerate() {
             let y = inner.y + i as u16;
@@ -7174,7 +7182,8 @@ impl App {
         };
         let h = (inner.h as usize).saturating_sub(1);
         self.pv_off = self.pv_off.min(lines.len().saturating_sub(h));
-        Self::draw_scroll_bar(cv, l, inner, self.pv_off, lines.len(), h);
+        lvim_fuzzy_ui::listview::scroll_bar(cv, l, Rect { h: 1, ..inner }, self.pv_off, lines.len(), h);
+        lvim_fuzzy_ui::listview::thumb(cv, inner.x + inner.w, inner.y + 1, h, self.pv_off, lines.len(), Style { bg: l.panel.bg, ..l.preview_scrollbar });
         let inner = Rect { x: inner.x + 1, y: inner.y + 1, w: inner.w.saturating_sub(1), h: inner.h.saturating_sub(1) };
         let mut carry = Style::default();
         for (i, line) in lines.iter().enumerate() {
