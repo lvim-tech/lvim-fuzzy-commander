@@ -6655,7 +6655,7 @@ impl App {
             // the quick view of a folder: it scrolls by its own offset, its prompt row tells which rows show
             p.offset = p.offset.min(p.shown.len().saturating_sub(list.h as usize));
             let (off, total) = (p.offset, p.shown.len());
-            self.draw_scroll_bar(cv, l, Rect { x: r.x, y: py, w: r.w, h: 1 }, off, total, list.h as usize);
+            Self::draw_scroll_bar(cv, l, Rect { x: r.x, y: py, w: r.w, h: 1 }, off, total, list.h as usize);
         }
         let p = &mut self.panels[i];
         if !pseudo {
@@ -6997,7 +6997,8 @@ impl App {
                 }
             }
             if let Some(n) = self.nvim.as_mut() {
-                n.size(inner.w as usize, inner.h as usize);
+                // the bar of the lines shown takes the first row, the text starts under the icons' column (one cell in), as the other previews
+                n.size(inner.w.saturating_sub(1) as usize, inner.h.saturating_sub(1) as usize);
                 let shown = n.grid.lock().unwrap().shown.clone();
                 if shown.as_deref() != Some(ps.as_str()) {
                     let pending = self.pv_path_sent.as_deref() != Some(ps.as_str());
@@ -7012,7 +7013,12 @@ impl App {
                         self.nvim = None;
                         self.nvim_failed = true;
                     } else if g.ready {
-                        let (gw, gh) = (g.w.min(inner.w as usize), g.h.min(inner.h as usize));
+                        let (top, bot, total) = g.view;
+                        if total > 0 {
+                            let shown = (bot + 1).saturating_sub(top.max(1));
+                            Self::draw_scroll_bar(cv, l, inner, top.max(1) - 1, total, shown.max(1));
+                        }
+                        let (gw, gh) = (g.w.min(inner.w.saturating_sub(1) as usize), g.h.min(inner.h.saturating_sub(1) as usize));
                         for row in 0..gh {
                             for col in 0..gw {
                                 let cell = &g.cells[row * g.w + col];
@@ -7020,8 +7026,8 @@ impl App {
                                     continue;
                                 }
                                 let st = g.style(cell.hl);
-                                let x = inner.x + col as u16;
-                                let y = inner.y + row as u16;
+                                let x = inner.x + 1 + col as u16;
+                                let y = inner.y + 1 + row as u16;
                                 cv.fill(Rect { x, y, w: 1, h: 1 }, Style { bg: st.bg, ..Style::default() });
                                 cv.put(x, y, &cell.text, st, inner.x + inner.w);
                             }
@@ -7069,7 +7075,7 @@ impl App {
 
     /// The bar over a quick view's text: which lines are shown (from – to / all) under the icons' column, and at the right end how to
     /// scroll (only when there is something to scroll); an empty file or folder says `No data`. The body is the rows under the bar.
-    fn draw_scroll_bar(&self, cv: &mut Canvas, l: &Look, inner: Rect, off: usize, total: usize, visible: usize) {
+    fn draw_scroll_bar(cv: &mut Canvas, l: &Look, inner: Rect, off: usize, total: usize, visible: usize) {
         let field = lvim_fuzzy_ui::lvim::search_field(l);
         cv.fill(Rect { x: inner.x, y: inner.y, w: inner.w, h: 1 }, field);
         let left = if total == 0 { " 0 / 0".to_string() } else { format!(" {}–{} / {}", off + 1, (off + visible).min(total), total) };
@@ -7099,16 +7105,11 @@ impl App {
         // the bar takes the first row; the text is under it, starting where the icons of the panels' rows do
         let h = (inner.h as usize).saturating_sub(1);
         self.pv_off = self.pv_off.min(total.saturating_sub(h));
-        self.draw_scroll_bar(cv, l, inner, self.pv_off, total, h);
+        Self::draw_scroll_bar(cv, l, inner, self.pv_off, total, h);
         let inner = Rect { x: inner.x + 1, y: inner.y + 1, w: inner.w.saturating_sub(1), h: inner.h.saturating_sub(1) };
-        let nr_w = if view.is_dir { 0 } else { total.max(1).to_string().len() as u16 + 1 };
         for (i, line) in view.lines.iter().skip(self.pv_off).take(h).enumerate() {
             let y = inner.y + i as u16;
-            let lnum = self.pv_off + i + 1;
             let mut x = inner.x;
-            if nr_w > 0 {
-                x = cv.put(x, y, &format!("{lnum:>w$} ", w = nr_w as usize - 1), l.line_nr, inner.x + inner.w);
-            }
             let spans = view.spans.get(self.pv_off + i);
             for (ci, ch) in line.chars().enumerate() {
                 if x >= inner.x + inner.w {
@@ -7173,7 +7174,7 @@ impl App {
         };
         let h = (inner.h as usize).saturating_sub(1);
         self.pv_off = self.pv_off.min(lines.len().saturating_sub(h));
-        self.draw_scroll_bar(cv, l, inner, self.pv_off, lines.len(), h);
+        Self::draw_scroll_bar(cv, l, inner, self.pv_off, lines.len(), h);
         let inner = Rect { x: inner.x + 1, y: inner.y + 1, w: inner.w.saturating_sub(1), h: inner.h.saturating_sub(1) };
         let mut carry = Style::default();
         for (i, line) in lines.iter().enumerate() {
